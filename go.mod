@@ -1,6 +1,6 @@
 module github.com/zhimoe/aglet
 
-go 1.27.4
+go 1.26.10
 
 require (
 	charm.land/bubbles/v2 v2.2.2

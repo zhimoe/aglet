@@ -14,9 +14,9 @@ import (
 	"text/template"
 	"text/template/parse"
 
+	"log"
 	"github.com/google/safehtml"
 	"github.com/google/safehtml/uncheckedconversions"
-	"log"
 )
 
 // Template is a specialized Template from "text/template" that produces a safe
@@ -70,7 +70,6 @@ func (t *Template) Templates() []*Template {
 //
 // missingkey: Control the behavior during execution if a map is
 // indexed with a key that is not present in the map.
-//
 //	"missingkey=default" or "missingkey=invalid"
 //		The default behavior: Do nothing and continue execution.
 //		If printed, the result of the index operation is the string
@@ -79,6 +78,7 @@ func (t *Template) Templates() []*Template {
 //		The operation returns the zero value for the map type's element.
 //	"missingkey=error"
 //		Execution stops immediately with an error.
+//
 func (t *Template) Option(opt ...string) *Template {
 	t.text.Option(opt...)
 	return t
@@ -399,9 +399,8 @@ func (t *Template) Funcs(funcMap FuncMap) *Template {
 // URIs are found in template text.
 //
 // For example, the following templates will cause errors:
-//
-//	<span onclick="doThings();">A thing.</span> // inline event handler "onclick"
-//	<a href="javascript:linkClicked()">foo</a>  // javascript: URI present
+//     <span onclick="doThings();">A thing.</span> // inline event handler "onclick"
+//     <a href="javascript:linkClicked()">foo</a>  // javascript: URI present
 func (t *Template) CSPCompatible() *Template {
 	t.nameSpace.mu.Lock()
 	t.nameSpace.cspCompatible = true
@@ -430,7 +429,6 @@ func (t *Template) Lookup(name string) *Template {
 // Must is a helper that wraps a call to a function returning (*Template, error)
 // and panics if the error is non-nil. It is intended for use in variable initializations
 // such as
-//
 //	var t = template.Must(template.New("name").Parse("html"))
 func Must(t *Template, err error) *Template {
 	if err != nil {
