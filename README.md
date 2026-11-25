@@ -31,6 +31,15 @@ go mod tidy
 go build -o aglet ./cmd/aglet
 ```
 
+`aglet` is pure Go and does not require cgo: SQLite uses the pure-Go
+`glebarez/sqlite` + `modernc.org/sqlite` stack. You can force a no-cgo build
+(or cross-compile a static Linux binary):
+
+```bash
+CGO_ENABLED=0 go build -o aglet ./cmd/aglet
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o aglet-linux ./cmd/aglet
+```
+
 ## Quick start
 
 ```bash
