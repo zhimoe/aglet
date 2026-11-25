@@ -25,6 +25,7 @@ type ApprovalRequest struct {
 	Server   string // MCP server name; empty for local tools
 	Summary  string
 	Args     map[string]any
+	Diff     string
 }
 
 // Approver asks the frontend (headless stdin or TUI modal) for a decision.
@@ -40,23 +41,42 @@ const (
 	classDeny
 )
 
-// Policy applies allow/ask/deny rules and remembers session-level grants.
+// Policy applies allow/ask/deny rules, an approval mode, and session grants.
 type Policy struct {
 	auto    []string
 	require []string
 	deny    []string
+	mode    string
 
 	mu             sync.Mutex
 	sessionAllowed map[string]bool
 }
 
-func NewPolicy(cfg config.PermissionsConfig) *Policy {
+func NewPolicy(cfg config.PermissionsConfig, modes ...string) *Policy {
+	mode := config.ApprovalAsk
+	if len(modes) > 0 && modes[0] != "" {
+		mode = config.NormalizeApprovalMode(modes[0])
+	}
 	return &Policy{
 		auto:           append([]string(nil), cfg.AutoApprove...),
 		require:        append([]string(nil), cfg.RequireApproval...),
 		deny:           append([]string(nil), cfg.Deny...),
+		mode:           mode,
 		sessionAllowed: map[string]bool{},
 	}
+}
+
+func (p *Policy) Mode() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.mode
+}
+
+func (p *Policy) SetMode(mode string) {
+	mode = config.NormalizeApprovalMode(mode)
+	p.mu.Lock()
+	p.mode = mode
+	p.mu.Unlock()
 }
 
 func matchAny(patterns []string, name string) bool {
@@ -72,19 +92,43 @@ func matchAny(patterns []string, name string) bool {
 	return false
 }
 
-func (p *Policy) decide(tool string) class {
-	if matchAny(p.deny, tool) {
+var readOnlyTools = map[string]bool{
+	"read_file":   true,
+	"list_dir":    true,
+	"glob":        true,
+	"grep":        true,
+	"git_status":  true,
+	"git_diff":    true,
+	"git_log":     true,
+	"load_skill":  true,
+	"update_plan": true,
+}
+
+func (p *Policy) decide(req ApprovalRequest) class {
+	if matchAny(p.deny, req.ToolName) {
 		return classDeny
 	}
-	if matchAny(p.require, tool) {
+	switch p.Mode() {
+	case config.ApprovalReadOnly:
+		if readOnlyTools[req.ToolName] {
+			return classAllow
+		}
+		return classDeny
+	case config.ApprovalAutoEdit:
+		if readOnlyTools[req.ToolName] || req.ToolName == "write_file" || req.ToolName == "edit_file" {
+			return classAllow
+		}
 		return classAsk
-	}
-	if matchAny(p.auto, tool) {
+	case config.ApprovalFullAuto:
 		return classAllow
 	}
-	// MCP tools are sensitive by default; built-in tools are explicit in the
-	// default config anyway. Anything unknown asks.
-	if strings.HasPrefix(tool, "mcp_") || strings.HasPrefix(tool, "mcp:") {
+	if matchAny(p.require, req.ToolName) {
+		return classAsk
+	}
+	if matchAny(p.auto, req.ToolName) {
+		return classAllow
+	}
+	if strings.HasPrefix(req.ToolName, "mcp_") || strings.HasPrefix(req.ToolName, "mcp:") {
 		return classAsk
 	}
 	return classAsk
@@ -92,29 +136,24 @@ func (p *Policy) decide(tool string) class {
 
 // Authorize enforces the policy. For classAsk it calls approver and records a
 // session grant when the user chooses "always".
-func (p *Policy) Authorize(ctx context.Context, tool, server, summary string, args map[string]any, approver Approver) error {
-	switch p.decide(tool) {
+func (p *Policy) Authorize(ctx context.Context, req ApprovalRequest, approver Approver) error {
+	switch p.decide(req) {
 	case classDeny:
-		return fmt.Errorf("tool %q denied by policy", tool)
+		return fmt.Errorf("tool %q denied by policy (mode %s)", req.ToolName, p.Mode())
 	case classAllow:
 		return nil
 	}
 
 	p.mu.Lock()
-	allowed := p.sessionAllowed[tool]
+	allowed := p.sessionAllowed[req.ToolName]
 	p.mu.Unlock()
 	if allowed {
 		return nil
 	}
 	if approver == nil {
-		return fmt.Errorf("tool %q requires approval but no approver is configured", tool)
+		return fmt.Errorf("tool %q requires approval but no approver is configured", req.ToolName)
 	}
-	d, err := approver.Approve(ctx, ApprovalRequest{
-		ToolName: tool,
-		Server:   server,
-		Summary:  summary,
-		Args:     args,
-	})
+	d, err := approver.Approve(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -123,16 +162,15 @@ func (p *Policy) Authorize(ctx context.Context, tool, server, summary string, ar
 		return nil
 	case DecisionAllowSession:
 		p.mu.Lock()
-		p.sessionAllowed[tool] = true
+		p.sessionAllowed[req.ToolName] = true
 		p.mu.Unlock()
 		return nil
 	default:
-		return fmt.Errorf("tool %q rejected by user", tool)
+		return fmt.Errorf("tool %q rejected by user", req.ToolName)
 	}
 }
 
-// AllowSession grants a tool for this policy instance. Used by tests and by
-// frontends that implement their own "always" handling.
+// AllowSession grants a tool for this policy instance.
 func (p *Policy) AllowSession(tool string) {
 	p.mu.Lock()
 	p.sessionAllowed[tool] = true

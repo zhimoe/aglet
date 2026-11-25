@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	adksession "google.golang.org/adk/v2/session"
+
+	"github.com/zhimoe/aglet/internal/plan"
 )
 
 type EventType string
@@ -18,6 +20,7 @@ const (
 	EventUsage      EventType = "usage"
 	EventError      EventType = "error"
 	EventDone       EventType = "done"
+	EventPlan       EventType = "plan"
 )
 
 type Event struct {
@@ -27,6 +30,7 @@ type Event struct {
 	Call   *ToolCall
 	Result *ToolResult
 	Usage  *Usage
+	Plan   []plan.Step
 	Err    error
 }
 
@@ -83,7 +87,8 @@ func (m *Mapper) Map(ev *adksession.Event) []Event {
 			switch {
 			case p.FunctionCall != nil:
 				out = append(out, Event{
-					Type: EventToolCall,
+					Type:   EventToolCall,
+					Author: ev.Author,
 					Call: &ToolCall{
 						ID:   p.FunctionCall.ID,
 						Name: p.FunctionCall.Name,
@@ -93,7 +98,8 @@ func (m *Mapper) Map(ev *adksession.Event) []Event {
 			case p.FunctionResponse != nil:
 				text, isErr := responseText(p.FunctionResponse.Response)
 				out = append(out, Event{
-					Type: EventToolResult,
+					Type:   EventToolResult,
+					Author: ev.Author,
 					Result: &ToolResult{
 						ID:      p.FunctionResponse.ID,
 						Name:    p.FunctionResponse.Name,

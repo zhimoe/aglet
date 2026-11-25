@@ -103,6 +103,72 @@ func TestResolveProfileOverride(t *testing.T) {
 	}
 }
 
+func TestPhase2Defaults(t *testing.T) {
+	cfg := Defaults()
+	if cfg.ApprovalMode != ApprovalAsk {
+		t.Fatalf("approval mode = %q", cfg.ApprovalMode)
+	}
+	if len(cfg.Context.InstructionFiles) == 0 || !cfg.Context.SkillsEnabledValue() {
+		t.Fatalf("context defaults = %#v", cfg.Context)
+	}
+	if cfg.Agent.Compaction.TokenThreshold != 0 {
+		t.Fatal("compaction should default off")
+	}
+	for _, needle := range []string{`"approval_mode"`, `"context"`, `"compaction"`} {
+		if !strings.Contains(ExampleJSON, needle) {
+			t.Fatalf("ExampleJSON missing %s", needle)
+		}
+	}
+}
+
+func TestApprovalModeNormalizeAndValidate(t *testing.T) {
+	cases := map[string]string{
+		"":             ApprovalAsk,
+		"default":      ApprovalAsk,
+		"plan":         ApprovalReadOnly,
+		"accept-edits": ApprovalAutoEdit,
+		"auto":         ApprovalFullAuto,
+	}
+	for in, want := range cases {
+		if got := NormalizeApprovalMode(in); got != want {
+			t.Fatalf("NormalizeApprovalMode(%q) = %q, want %q", in, got, want)
+		}
+	}
+	cfg := Defaults()
+	cfg.ApprovalMode = "bogus"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid approval mode")
+	}
+}
+
+func TestCompactionValidation(t *testing.T) {
+	cfg := Defaults()
+	cfg.Agent.Compaction = CompactionConfig{TokenThreshold: 1000}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected retention error")
+	}
+	cfg.Agent.Compaction = CompactionConfig{TokenThreshold: 1000, EventRetentionSize: 20}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	invalid := []CompactionConfig{
+		{EventRetentionSize: 20},
+		{OverlapSize: 5},
+		{CompactionInterval: 20, OverlapSize: 5, EventRetentionSize: 10},
+		{TokenThreshold: 1000, EventRetentionSize: 20, CompactionInterval: 10},
+	}
+	for i, comp := range invalid {
+		cfg.Agent.Compaction = comp
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("case %d: expected validation error for %#v", i, comp)
+		}
+	}
+	cfg.Agent.Compaction = CompactionConfig{CompactionInterval: 20, OverlapSize: 5}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("sliding-window-only compaction should be valid: %v", err)
+	}
+}
+
 func TestExpandPath(t *testing.T) {
 	home, err := os.UserHomeDir()
 	if err != nil {

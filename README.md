@@ -6,13 +6,18 @@ A small terminal coding agent built with **Google ADK for Go v2** and **Bubble T
 
 ## Features
 
-- **Headless and interactive**: stream one-shot answers, or use a minimal TUI.
+- **Headless and interactive**: stream one-shot answers, or use a TUI with Markdown rendering, a plan panel, and session switching.
 - **OpenAI-compatible providers**: OpenAI, DeepSeek, and any service that implements `/chat/completions`.
-- **Real tools**: read, write, edit, list, glob, grep, and run shell commands.
-- **Human approval**: read-only tools run automatically; writes, edits, commands, and MCP tools ask first.
+- **Real tools**: read, write, edit, list, glob, grep, shell, and git.
+- **Approval modes**: `ask`, `read-only`, `auto-edit`, and `full-auto`, plus per-tool allow/deny rules and session grants.
+- **Diff-aware approvals**: writes and edits show a unified diff before you approve them.
+- **Project context**: discovers `AGLET.md`, `AGENTS.md`, `AGENTS.override.md`, and `CLAUDE.md` from the workspace and its ancestors.
+- **Skills**: `SKILL.md` files with YAML frontmatter, loaded on demand with `load_skill`.
+- **Plan / todo panel**: the model updates a checklist with `update_plan`; the TUI renders it and tracks progress.
+- **Git workflow**: `git_status`, `git_diff`, `git_log`, `git_commit`, plus `/diff`, `/review`, and `aglet review`.
+- **Persistent sessions**: SQLite-backed sessions, list/resume/continue, history replay in the TUI.
 - **MCP client**: stdio, SSE, and streamable HTTP servers; tools are discovered and exposed to the agent.
-- **Persistent sessions**: SQLite-backed sessions, resumable with `--session`, with history replay in the TUI.
-- **Event bridge**: ADK events normalized into text, thought, tool call, tool result, usage, error, and done events.
+- **Event bridge**: ADK events normalized into text, thought, tool call, tool result, plan, usage, error, and done events.
 - **JSONL output**: machine-readable events for scripts and tests.
 - **No magic config**: one JSON file, no database server, no cloud dependency.
 
@@ -29,23 +34,22 @@ A small terminal coding agent built with **Google ADK for Go v2** and **Bubble T
 ```bash
 git clone https://github.com/zhimoe/aglet.git
 cd aglet
-go mod tidy
-go build -o aglet ./cmd/aglet
+go build -mod=vendor -o aglet ./cmd/aglet
 ```
+
+The repository vendors all dependencies, so the build works offline. If you
+change `go.mod`, refresh the vendor tree with `go mod tidy && go mod vendor`.
 
 `aglet` is pure Go and does not require cgo: SQLite uses the pure-Go
 `glebarez/sqlite` + `modernc.org/sqlite` stack. You can force a no-cgo build
 (or cross-compile a static Linux binary):
 
 ```bash
-CGO_ENABLED=0 go build -o aglet ./cmd/aglet
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o aglet-linux ./cmd/aglet
+CGO_ENABLED=0 go build -mod=vendor -o aglet ./cmd/aglet
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=vendor -o aglet-linux ./cmd/aglet
 ```
 
 ### Windows
-
-The repository includes `vendor/`, so a Windows build can run offline with
-`-mod=vendor`.
 
 From PowerShell:
 
@@ -94,27 +98,104 @@ export OPENAI_API_KEY=sk-...
 ```bash
 ./aglet run --profile deepseek "list the files in this repo and explain go.mod"
 
+# Agent CLI habits: exec is an alias for run
+./aglet exec --profile deepseek "summarize the architecture"
+
 # stdin works too
 printf 'summarize the architecture\n' | ./aglet run --profile deepseek
 
 # JSONL events
 ./aglet run --json --profile deepseek "run go test ./..."
+
+# Continue the most recent session
+./aglet run --continue "and what about the tests?"
+
+# Auto-approve edits but still ask for shell commands
+./aglet run --auto-edit "fix the failing test"
 ```
 
-Assistant text goes to stdout. Tool calls, tool results, usage, and errors go to stderr, so stdout stays clean for piping. `--json` writes one JSON object per line to stdout.
+Assistant text goes to stdout. Tool calls, tool results, plan updates, usage,
+and errors go to stderr, so stdout stays clean for piping. `--json` writes one
+JSON object per line to stdout.
 
 ### TUI
 
 ```bash
 ./aglet tui --profile deepseek
+./aglet resume                 # open the most recent session
+./aglet resume <session-id>
 ```
 
 - `Enter` sends; `Ctrl+J` inserts a newline.
 - `Esc` cancels a running turn (or clears the input when idle).
 - `Ctrl+C` cancels a running turn; when idle it exits.
-- `/help`, `/clear`, `/quit`.
-- Tool approvals appear as a dialog: `y` allow once, `a` always this session, `n`/`Esc` deny.
-- Use `--session ID` to resume a session. The transcript is replayed from the ADK session store.
+- Completed assistant messages are rendered as Markdown; tool output stays monospace.
+- The plan panel shows `update_plan` progress; the status bar shows the model, session, approval mode, token usage, and plan counts.
+- Tool approvals appear as a dialog with a diff for file changes: `y` allow once, `a` always this session, `n`/`Esc` deny.
+
+Shell escape:
+
+```text
+!git status
+!go test ./...
+```
+
+`!` commands run outside the model but still go through the approval policy.
+They are rejected in `read-only` mode.
+
+Slash commands:
+
+```text
+/help  /clear  /quit
+/sessions  /resume <id>  /new
+/skills  /status  /permissions  /mode <name>
+/plan [task]  /mcp  /diff  /review  /model
+```
+
+## CLI
+
+```text
+aglet run|exec [flags] [prompt]  one-shot / headless turn ("-" or pipe for stdin)
+aglet tui [flags]                interactive TUI
+aglet resume [ID] --last         open the TUI for a previous session
+aglet sessions list              list stored sessions (no model key needed)
+aglet review [--base REF]        review a git diff with a read-only policy
+aglet config init [--path P]     write an example config
+aglet config show                print resolved config (secrets redacted)
+aglet mcp list                   connect MCP servers and list tools
+aglet version
+```
+
+Common flags:
+
+```text
+--config PATH      config file (default: ./aglet.json or ~/.config/aglet/config.json)
+--profile NAME     profile from config (default: config.default_profile)
+--model NAME       override the profile model
+--workspace PATH   override workspace
+--session ID       resume/create a session
+--continue         continue the most recent session
+--mode NAME        ask | read-only | auto-edit | full-auto
+--show-thoughts    display thought events when the provider emits them
+```
+
+Aliases: `--read-only`, `--auto-edit`, `--full-auto`, `--plan`, `--yolo`.
+
+Run flags:
+
+```text
+--json             emit JSONL events instead of text
+--yes              auto-approve tools that require approval
+--deny             deny all tools that require approval
+--max-llm-calls N  cap model calls in this run
+```
+
+`aglet sessions list` prints newest first:
+
+```text
+ID                                    UPDATED           EVENTS  PREVIEW
+6f0f1e3c-...                          2026-11-25 21:36  12      fix the failing test
+```
 
 ## Configuration
 
@@ -125,11 +206,12 @@ Assistant text goes to stdout. Tool calls, tool results, usage, and errors go to
 3. `./aglet.json`
 4. `~/.config/aglet/config.json`
 
-A minimal config:
+A config with the Phase 2 fields:
 
 ```json
 {
   "default_profile": "deepseek",
+  "approval_mode": "ask",
   "profiles": {
     "deepseek": {
       "api": "chat_completions",
@@ -146,23 +228,151 @@ A minimal config:
   },
   "agent": {
     "max_llm_calls": 50,
-    "temperature": 0.2
+    "temperature": 0.2,
+    "compaction": {
+      "token_threshold": 0,
+      "event_retention_size": 0,
+      "compaction_interval": 0,
+      "overlap_size": 0
+    }
+  },
+  "context": {
+    "instruction_files": ["AGLET.md", "AGENTS.md", "AGENTS.override.md", "CLAUDE.md"],
+    "skills_dirs": [".agents/skills", ".aglet/skills", "~/.agents/skills", "~/.config/aglet/skills"],
+    "skills_enabled": true,
+    "max_instruction_bytes": 32768,
+    "max_skill_bytes": 65536
   },
   "workspace": ".",
   "permissions": {
-    "auto_approve": ["read_file", "list_dir", "glob", "grep"],
-    "require_approval": ["write_file", "edit_file", "run_command", "mcp_*"],
+    "auto_approve": ["read_file", "list_dir", "glob", "grep", "git_status", "git_diff", "git_log", "load_skill", "update_plan"],
+    "require_approval": ["write_file", "edit_file", "run_command", "git_commit", "mcp_*"],
     "deny": []
   },
-  "session_db": "~/.local/share/aglet/sessions.db"
+  "session_db": "~/.local/share/aglet/sessions.db",
+  "ui": {
+    "show_thoughts": true
+  }
 }
 ```
 
 - API keys are read only from environment variables. The config stores the env var name, never the key.
 - `api` is `chat_completions` by default. DeepSeek and most third-party OpenAI-compatible services require this; `responses` is available for providers that support the OpenAI Responses API.
 - `workspace` confines all file tools. Paths are checked lexically and through symlinks.
-- `permissions` precedence: `deny` > `require_approval` > `auto_approve`. Unlisted tools require approval.
 - `config show` prints the resolved config with MCP env/header values redacted.
+
+### Approval modes
+
+`approval_mode` (or `--mode`) controls the default policy. Explicit `deny`
+rules always win.
+
+| Mode | Behavior |
+|---|---|
+| `ask` (alias `default`) | Read tools auto-approve; writes, edits, commands, git commits, and MCP tools ask. |
+| `read-only` (alias `plan`) | Only read-only tools are allowed; writes, edits, shell, and MCP are rejected. |
+| `auto-edit` (alias `accept-edits`) | Reads plus `write_file`/`edit_file` are auto-approved; shell, commits, and MCP still ask. |
+| `full-auto` (alias `auto`, `yolo`) | Everything is auto-approved except explicit `deny` rules. |
+
+Read-only tools are `read_file`, `list_dir`, `glob`, `grep`, `git_status`,
+`git_diff`, `git_log`, `load_skill`, and `update_plan`.
+
+Within `ask`/`auto-edit`, precedence is: explicit `deny` > mode restrictions >
+`permissions.require_approval` > `permissions.auto_approve` > default ask.
+File writes and edits include a unified diff in the approval prompt.
+
+### Context files
+
+Instruction files are discovered per directory while walking from the
+filesystem root down to the workspace (like pi and Codex). Each directory
+contributes the first matching file from `instruction_files`. Files are
+size-capped and treated as untrusted context, not as executable instructions.
+
+Set `"instruction_files": []` to disable discovery. The content is injected
+into the system prompt inside `<project_instructions>` sections.
+
+### Skills
+
+Skills live in `<dir>/<name>/SKILL.md`. Default discovery directories:
+
+- `<workspace>/.agents/skills`
+- `<workspace>/.aglet/skills`
+- `~/.agents/skills`
+- `~/.config/aglet/skills`
+
+Additional directories can be listed in `context.skills_dirs`. Example:
+
+```markdown
+---
+name: git-review
+description: Review a diff for correctness and risk
+disable-model-invocation: false
+---
+
+# Git review
+
+1. Run `git_diff`.
+2. Look for correctness bugs, regressions, and missing tests.
+```
+
+The system prompt only contains a name/description/location index. The model
+calls `load_skill` to read the full body when needed. Set
+`disable-model-invocation: true` to keep a skill out of the model's index.
+Duplicate names keep the first skill discovered; malformed skills produce
+warnings without blocking startup. Use `/skills` in the TUI to list them.
+
+### Context compaction
+
+Compaction is disabled by default. To enable ADK's session compaction:
+
+```json
+"agent": {
+  "compaction": {
+    "token_threshold": 60000,
+    "event_retention_size": 20,
+    "compaction_interval": 0,
+    "overlap_size": 0
+  }
+}
+```
+
+`token_threshold` must be paired with `event_retention_size > 0`. When the
+threshold is crossed, older events are summarized and the most recent
+`event_retention_size` events are retained.
+
+### Plan and todo
+
+The model is instructed to call `update_plan` for multi-step work with steps
+such as `pending`, `in_progress`, and `completed`. The TUI replaces the plan
+panel on each update and shows `plan 2/5` in the status bar. Headless text mode
+prints `[plan]` to stderr; JSON mode emits a `plan` event.
+
+`/plan` switches the TUI to read-only planning mode and asks the model to
+produce a plan without making changes.
+
+## Git workflow
+
+| Tool | Purpose | Default approval |
+|---|---|---|
+| `git_status` | Working tree status | auto |
+| `git_diff` | Unstaged or staged diff | auto |
+| `git_log` | Recent one-line history | auto |
+| `git_commit` | Commit (optionally `git add -A`) | ask |
+
+`aglet review` collects the working-tree diff (or `--base REF`) and sends it to
+a read-only agent for review. In the TUI, `/diff` appends the current diff and
+`/review` starts a review turn using the `git_diff` tool.
+
+## Sessions
+
+Sessions are stored in SQLite via ADK's database session service.
+
+- `aglet sessions list` lists stored sessions without needing a model key.
+- `aglet resume [ID]` opens the TUI for a session; with no ID it opens the latest.
+- `aglet run --session ID` continues a session headlessly.
+- `aglet run --continue` (or `tui --continue`) selects the latest session.
+- In the TUI: `/sessions`, `/resume <id>`, and `/new`.
+
+Session switching is only allowed while idle.
 
 ## MCP
 
@@ -209,60 +419,80 @@ Inspect discovered tools without starting the agent:
 ./aglet mcp list
 ```
 
-MCP tools are exposed as `mcp_<server>_<tool>` (sanitized, max 64 characters). They are sensitive by default; use `permissions.auto_approve` for trusted read-only tools.
+MCP tools are exposed as `mcp_<server>_<tool>` (sanitized, max 64 characters).
+They are sensitive by default; use `permissions.auto_approve` for trusted
+read-only tools.
 
 ## Security model
 
 - File tools are restricted to the workspace, including symlink escape checks.
-- Writes, edits, commands, and MCP tools require confirmation by default.
+- Writes, edits, commands, git commits, and MCP tools require confirmation by default.
+- Approval modes can loosen or tighten this, but explicit `deny` rules always win.
 - In headless mode, non-TTY stdin denies sensitive tools unless `--yes` is passed. Use `--deny` to force rejection.
 - `run_command` has a default 120s timeout (max 600s), truncates output, and kills the process group on cancellation. On Windows it uses `cmd.exe /C` and `taskkill /T /F`.
+- Project instruction files and skills are untrusted context; the prompt tells the model not to follow instructions from them that conflict with the user or policy.
 - No OS-level sandbox is provided. Run `aglet` in a dedicated directory or container when working with untrusted code, and avoid `--yes` there.
 
 ## Architecture
 
 ```
 cmd/aglet            CLI entrypoint
-internal/cli         run / tui / config / mcp / version
-internal/agent       ADK runtime, event bridge, system prompt
-internal/tools       local file, search, and shell tools
+internal/cli         run / tui / resume / sessions / review / config / mcp
+internal/agent       ADK runtime, event bridge, prompt, compaction
+internal/tools       local file, search, shell, git, skill, and plan tools
 internal/mcp         custom MCP manager -> ADK function tools
-internal/permissions allow/ask/deny policy and approval interface
-internal/session     ADK database session service (SQLite)
-internal/headless    stream output and stdin approvals
-internal/tui         Bubble Tea v2 model and rendering
+internal/permissions approval modes, allow/ask/deny policy, session grants
+internal/instructions AGLET.md / AGENTS.md discovery and injection
+internal/skills      SKILL.md discovery, frontmatter, index rendering
+internal/plan        thread-safe plan board and status validation
+internal/diff        unified diffs for approvals
+internal/session     ADK database session service (SQLite), list/preview
+internal/headless    stream output, JSONL, stdin approvals
+internal/tui         Bubble Tea v2 model, Markdown rendering, plan panel
 internal/config      JSON config loading and validation
 ```
 
-The runtime owns ADK's `llmagent`, `runner`, and session service. Tools are wrapped with an approval policy. MCP tools are connected with the official Go SDK, discovered at startup, and wrapped as ADK function tools so they use the same approval flow as local tools.
+The runtime owns ADK's `llmagent`, `runner`, session service, plan board, and
+compaction configuration. Tools are wrapped with an approval policy. MCP tools
+are connected with the official Go SDK, discovered at startup, and wrapped as
+ADK function tools so they use the same approval flow as local tools.
 
 Events flow in one direction:
 
 ```
 ADK session.Event
     -> agent.Mapper (partial/final text dedupe, tool calls/results, usage)
+    -> plan board update_plan event
     -> headless writer or TUI event channel
 ```
 
 ## Development
 
 ```bash
-gofmt -w .
+go fmt ./...
 go vet ./...
 go test ./...
 go test -race ./internal/...
-go build -o aglet ./cmd/aglet
+go mod tidy && go mod vendor
+go build -mod=vendor -o aglet ./cmd/aglet
 ```
 
-Tests cover event mapping, a fake-model runtime + tool loop, config validation/redaction, permission precedence, file/search tools, headless approvals, and in-memory MCP discovery.
+Do not run `gofmt -w .` at the repository root: it would rewrite vendored
+upstream files. Use `go fmt ./...`, which only formats this module.
+
+Tests cover event mapping, a fake-model runtime + tool loop, plan events and
+session switching, config validation/redaction/compaction, permission modes,
+diff and skill discovery, instructions, git helpers, file/search tools,
+headless approvals, and in-memory MCP discovery.
 
 ## Current limitations
 
-- TUI rendering is plain text + lipgloss; Markdown, syntax highlighting, and diff previews are not implemented yet.
-- No skills, hooks, subagents, ACP server, or LSP integration yet.
+- TUI Markdown rendering applies to completed assistant messages; streaming text is plain.
+- No syntax highlighting, hooks, subagents, ACP server, or LSP integration yet.
+- No session tree/fork/clone, steering queue, prompt templates, or runtime `/model` switching.
 - MCP resources/prompts and runtime reload are not implemented; only tools are discovered.
-- Sessions work across processes, but there is no session list UI yet.
 - No OS sandbox; approval and workspace checks are the current boundary.
 - The Windows target is cross-compiled and compile-checked here; it has not been run on a real Windows machine in this repo's test setup. Please run `go test ./...` and a quick `aglet run` on Windows before relying on it.
 
-These are deliberate next steps rather than hidden behavior. The skeleton is meant to be small enough to read and extend.
+These are deliberate next steps rather than hidden behavior. The skeleton is
+meant to be small enough to read and extend.

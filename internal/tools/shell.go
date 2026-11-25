@@ -26,13 +26,23 @@ type runCommandArgs struct {
 	TimeoutSec int    `json:"timeout_sec,omitempty" jsonschema:"Timeout in seconds. Default 120, max 600."`
 }
 
-type runCommandResult struct {
+// ShellRequest is the frontend-facing shell escape request.
+type ShellRequest struct {
+	Command    string
+	Cwd        string
+	TimeoutSec int
+}
+
+type ShellResult struct {
 	Command   string `json:"command"`
 	ExitCode  int    `json:"exit_code"`
 	Stdout    string `json:"stdout"`
 	TimedOut  bool   `json:"timed_out"`
 	Truncated bool   `json:"truncated"`
 }
+
+// runCommandResult is kept as the tool schema name.
+type runCommandResult = ShellResult
 
 type limitedBuffer struct {
 	buf       bytes.Buffer
@@ -59,71 +69,79 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 
 func (b *limitedBuffer) String() string { return b.buf.String() }
 
+// RunShell executes a command after policy approval. TUI shell escape and the
+// run_command tool share this implementation.
+func RunShell(ctx context.Context, deps Deps, req ShellRequest) (ShellResult, error) {
+	if strings.TrimSpace(req.Command) == "" {
+		return ShellResult{}, fmt.Errorf("command is required")
+	}
+	cwd := req.Cwd
+	if cwd == "" {
+		cwd = "."
+	}
+	if err := authorize(ctx, deps, "run_command", "Run: "+req.Command, map[string]any{
+		"command": req.Command, "cwd": cwd, "timeout_sec": req.TimeoutSec,
+	}); err != nil {
+		return ShellResult{}, err
+	}
+	dir, err := resolvePath(deps.Workspace, cwd)
+	if err != nil {
+		return ShellResult{}, err
+	}
+	timeout := time.Duration(req.TimeoutSec) * time.Second
+	if req.TimeoutSec <= 0 {
+		timeout = defaultCommandTimeout
+	}
+	if timeout > maxCommandTimeout {
+		timeout = maxCommandTimeout
+	}
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmd := newShellCommand(runCtx, req.Command)
+	cmd.Dir = dir
+	cmd.Env = os.Environ()
+	out := &limitedBuffer{limit: maxCommandOutput}
+	cmd.Stdout = out
+	cmd.Stderr = out
+	setProcessGroup(cmd)
+
+	if err := cmd.Start(); err != nil {
+		return ShellResult{}, err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case <-runCtx.Done():
+		killProcessGroup(cmd.Process.Pid)
+		<-done
+		res := ShellResult{
+			Command: req.Command, Stdout: out.String(),
+			TimedOut: true, Truncated: out.truncated, ExitCode: -1,
+		}
+		if ctx.Err() != nil {
+			return res, ctx.Err()
+		}
+		return res, nil
+	case err := <-done:
+		res := ShellResult{Command: req.Command, Stdout: out.String(), Truncated: out.truncated}
+		if err != nil {
+			if ee, ok := err.(*exec.ExitError); ok {
+				res.ExitCode = ee.ExitCode()
+			} else {
+				return res, err
+			}
+		}
+		return res, nil
+	}
+}
+
 func newRunCommandTool(deps Deps) (tool.Tool, error) {
 	handler := func(ctx adkagent.Context, args runCommandArgs) (runCommandResult, error) {
-		if strings.TrimSpace(args.Command) == "" {
-			return runCommandResult{}, fmt.Errorf("command is required")
-		}
-		cwd := args.Cwd
-		if cwd == "" {
-			cwd = "."
-		}
-		if err := authorize(ctx, deps, "run_command", "Run: "+args.Command, map[string]any{
-			"command": args.Command, "cwd": cwd, "timeout_sec": args.TimeoutSec,
-		}); err != nil {
-			return runCommandResult{}, err
-		}
-		dir, err := resolvePath(deps.Workspace, cwd)
-		if err != nil {
-			return runCommandResult{}, err
-		}
-		timeout := time.Duration(args.TimeoutSec) * time.Second
-		if args.TimeoutSec <= 0 {
-			timeout = defaultCommandTimeout
-		}
-		if timeout > maxCommandTimeout {
-			timeout = maxCommandTimeout
-		}
-		runCtx, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
-
-		cmd := newShellCommand(runCtx, args.Command)
-		cmd.Dir = dir
-		cmd.Env = os.Environ()
-		out := &limitedBuffer{limit: maxCommandOutput}
-		cmd.Stdout = out
-		cmd.Stderr = out
-		setProcessGroup(cmd)
-
-		if err := cmd.Start(); err != nil {
-			return runCommandResult{}, err
-		}
-		done := make(chan error, 1)
-		go func() { done <- cmd.Wait() }()
-
-		select {
-		case <-runCtx.Done():
-			killProcessGroup(cmd.Process.Pid)
-			<-done
-			res := runCommandResult{
-				Command: args.Command, Stdout: out.String(),
-				TimedOut: true, Truncated: out.truncated, ExitCode: -1,
-			}
-			if ctx.Err() != nil {
-				return res, ctx.Err()
-			}
-			return res, nil
-		case err := <-done:
-			res := runCommandResult{Command: args.Command, Stdout: out.String(), Truncated: out.truncated}
-			if err != nil {
-				if ee, ok := err.(*exec.ExitError); ok {
-					res.ExitCode = ee.ExitCode()
-				} else {
-					return res, err
-				}
-			}
-			return res, nil
-		}
+		return RunShell(ctx, deps, ShellRequest{
+			Command: args.Command, Cwd: args.Cwd, TimeoutSec: args.TimeoutSec,
+		})
 	}
 	return functiontool.New(functiontool.Config{
 		Name:        "run_command",

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	adksession "google.golang.org/adk/v2/session"
@@ -15,6 +17,14 @@ import (
 
 	"github.com/zhimoe/aglet/internal/config"
 )
+
+// Info is a lightweight session listing entry.
+type Info struct {
+	ID        string
+	UpdatedAt time.Time
+	Events    int
+	Preview   string
+}
 
 // Store owns the SQLite session service.
 type Store struct {
@@ -73,6 +83,53 @@ func (s *Store) Ensure(ctx context.Context, id string) (string, error) {
 		return "", fmt.Errorf("create session: %w", err)
 	}
 	return created.Session.ID(), nil
+}
+
+// List returns sessions ordered oldest to newest (ADK's ordering).
+func (s *Store) List(ctx context.Context) ([]Info, error) {
+	res, err := s.Service.List(ctx, &adksession.ListRequest{AppName: s.AppName, UserID: s.UserID})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Info, 0, len(res.Sessions))
+	for _, sess := range res.Sessions {
+		info := Info{
+			ID:        sess.ID(),
+			UpdatedAt: sess.LastUpdateTime(),
+		}
+		// ADK's database List does not load events, so fetch the full session
+		// to compute the event count and preview.
+		if full, err := s.Get(ctx, info.ID); err == nil {
+			info.Events = full.Events().Len()
+			var preview string
+			for ev := range full.Events().All() {
+				if ev.Author != "user" || ev.Content == nil {
+					continue
+				}
+				for _, p := range ev.Content.Parts {
+					if p != nil && p.Text != "" {
+						preview = p.Text
+						break
+					}
+				}
+				if preview != "" {
+					break
+				}
+			}
+			preview = strings.Join(strings.Fields(preview), " ")
+			info.Preview = truncateRunes(preview, 100)
+		}
+		out = append(out, info)
+	}
+	return out, nil
+}
+
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "..."
 }
 
 func (s *Store) Get(ctx context.Context, id string) (adksession.Session, error) {

@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"strings"
 
+	"charm.land/glamour/v2"
 	"charm.land/lipgloss/v2"
+
+	"github.com/zhimoe/aglet/internal/plan"
 )
 
 var (
@@ -34,7 +37,11 @@ func (m *Model) renderTranscript() string {
 		case itemUser:
 			b.WriteString(userStyle.Render("you: ") + it.text)
 		case itemAssistant:
-			b.WriteString(it.text)
+			if it.streaming {
+				b.WriteString(it.text)
+			} else {
+				b.WriteString(m.renderMarkdown(it))
+			}
 		case itemThought:
 			if !m.cfg.ShowThoughts {
 				continue
@@ -53,6 +60,8 @@ func (m *Model) renderTranscript() string {
 			b.WriteString(errorStyle.Render("error: " + it.text))
 		case itemInfo:
 			b.WriteString(infoStyle.Render(it.text))
+		case itemPlan:
+			b.WriteString(m.renderPlan())
 		}
 		b.WriteString("\n\n")
 	}
@@ -60,11 +69,11 @@ func (m *Model) renderTranscript() string {
 }
 
 func (m *Model) renderHeader() string {
-	sid := m.cfg.SessionID
+	sid := m.sessionID
 	if len(sid) > 8 {
 		sid = sid[:8]
 	}
-	s := fmt.Sprintf("aglet  %s/%s  session %s  %s", m.cfg.Profile, m.cfg.ModelName, sid, m.cfg.Workspace)
+	s := fmt.Sprintf("aglet  %s/%s  session %s  mode %s  %s", m.cfg.Profile, m.cfg.ModelName, sid, m.approvalMode, m.cfg.Workspace)
 	if m.width > 0 {
 		s = truncatePlain(s, m.width-1)
 	}
@@ -81,6 +90,15 @@ func (m *Model) renderStatus() string {
 	default:
 		s = "enter send · ctrl+j newline · esc clear · ctrl+c quit"
 	}
+	if n := len(m.planSteps); n > 0 {
+		done := 0
+		for _, st := range m.planSteps {
+			if st.Status == plan.StatusCompleted {
+				done++
+			}
+		}
+		s += fmt.Sprintf(" · plan %d/%d", done, n)
+	}
 	if m.usage.Total > 0 {
 		s += fmt.Sprintf(" · tokens %d/%d/%d", m.usage.Prompt, m.usage.Completion, m.usage.Total)
 	}
@@ -90,28 +108,115 @@ func (m *Model) renderStatus() string {
 	return statusStyle.Render(s)
 }
 
+func (m *Model) renderMarkdown(it *item) string {
+	if strings.TrimSpace(it.text) == "" {
+		return ""
+	}
+	width := max(20, m.width-4)
+	key := fmt.Sprintf("%d:%s", width, it.text)
+	if it.renderedKey == key && it.rendered != "" {
+		return it.rendered
+	}
+	if m.mdRenderer == nil || m.mdWidth != width {
+		r, err := glamour.NewTermRenderer(
+			glamour.WithStylePath("dark"),
+			glamour.WithWordWrap(width),
+		)
+		if err != nil {
+			return it.text
+		}
+		m.mdRenderer = r
+		m.mdWidth = width
+	}
+	out, err := m.mdRenderer.Render(it.text)
+	if err != nil {
+		return it.text
+	}
+	out = strings.TrimRight(out, "\n")
+	it.rendered = out
+	it.renderedKey = key
+	return out
+}
+
+func (m *Model) renderPlan() string {
+	if len(m.planSteps) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Plan:\n")
+	for i, step := range m.planSteps {
+		mark := "[ ]"
+		style := statusStyle
+		switch step.Status {
+		case plan.StatusInProgress:
+			mark = "[~]"
+			style = infoStyle
+		case plan.StatusCompleted:
+			mark = "[x]"
+			style = dimStyle
+		}
+		b.WriteString(style.Render(fmt.Sprintf("  %s %d. %s", mark, i+1, step.Step)))
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
 func (m *Model) renderApproval() string {
 	if m.pending == nil {
 		return ""
 	}
 	req := m.pending.req
-	var b strings.Builder
-	fmt.Fprintf(&b, "Approval required: %s", req.ToolName)
+	var head strings.Builder
+	fmt.Fprintf(&head, "Approval required: %s", req.ToolName)
 	if req.Server != "" {
-		fmt.Fprintf(&b, "  (server: %s)", req.Server)
+		fmt.Fprintf(&head, "  (server: %s)", req.Server)
 	}
 	if req.Summary != "" {
-		b.WriteString("\n" + req.Summary)
+		head.WriteString("\n" + req.Summary)
 	}
 	if len(req.Args) > 0 {
-		b.WriteString("\n" + prettyArgs(req.Args))
+		head.WriteString("\n" + prettyArgs(req.Args))
 	}
-	b.WriteString("\n[y] allow once   [a] always this session   [n]/esc deny")
 	width := 60
 	if m.width > 4 {
 		width = m.width - 2
 	}
-	return approvalStyle.Width(width).Render(truncateLines(b.String(), max(20, width-4)))
+	innerWidth := max(20, width-4)
+	lines := strings.Split(head.String(), "\n")
+	for i := range lines {
+		lines[i] = truncatePlain(lines[i], innerWidth)
+	}
+	if req.Diff != "" {
+		lines = append(lines, colorDiff(req.Diff, innerWidth))
+	}
+	lines = append(lines, "[y] allow once   [a] always this session   [n]/esc deny")
+	return approvalStyle.Width(width).Render(strings.Join(lines, "\n"))
+}
+
+func colorDiff(diff string, width int) string {
+	lines := strings.Split(strings.TrimRight(diff, "\n"), "\n")
+	if len(lines) > 80 {
+		lines = append(lines[:80], "... (diff truncated)")
+	}
+	var b strings.Builder
+	b.WriteString("diff:\n")
+	for _, line := range lines {
+		line = truncatePlain(line, width)
+		switch {
+		case strings.HasPrefix(line, "+++"), strings.HasPrefix(line, "---"):
+			b.WriteString(headerStyle.Render(line))
+		case strings.HasPrefix(line, "@@"):
+			b.WriteString(infoStyle.Render(line))
+		case strings.HasPrefix(line, "+"):
+			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render(line))
+		case strings.HasPrefix(line, "-"):
+			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Render(line))
+		default:
+			b.WriteString(dimStyle.Render(line))
+		}
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func prettyArgs(v map[string]any) string {

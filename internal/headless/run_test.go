@@ -2,10 +2,13 @@ package headless
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
+	"github.com/zhimoe/aglet/internal/agent"
 	"github.com/zhimoe/aglet/internal/permissions"
+	"github.com/zhimoe/aglet/internal/plan"
 )
 
 func TestApproverYes(t *testing.T) {
@@ -32,6 +35,20 @@ func TestApproverDeny(t *testing.T) {
 	_, err := a.Approve(context.Background(), permissions.ApprovalRequest{ToolName: "write_file"})
 	if err == nil {
 		t.Fatal("expected denial")
+	}
+}
+
+func TestEventJSONPlan(t *testing.T) {
+	b, err := json.Marshal(eventJSON(agent.Event{
+		Type: agent.EventPlan,
+		Plan: []plan.Step{{Step: "one", Status: plan.StatusInProgress}, {Step: "two", Status: plan.StatusPending}},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	if !strings.Contains(s, `"type":"plan"`) || !strings.Contains(s, `"step":"one"`) || !strings.Contains(s, `"status":"in_progress"`) {
+		t.Fatalf("json = %s", s)
 	}
 }
 

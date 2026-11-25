@@ -156,7 +156,9 @@ func discoverTools(ctx context.Context, serverName string, s config.MCPServerCon
 			}
 			summary := fmt.Sprintf("%s/%s", server, mcpName)
 			if policy != nil {
-				if err := policy.Authorize(ctx, name, server, summary, args, approver); err != nil {
+				if err := policy.Authorize(ctx, permissions.ApprovalRequest{
+					ToolName: name, Server: server, Summary: summary, Args: args,
+				}, approver); err != nil {
 					return nil, err
 				}
 			} else if needsConfirm {

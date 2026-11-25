@@ -12,6 +12,9 @@ import (
 	adkagent "google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/adk/v2/tool/functiontool"
+
+	diffutil "github.com/zhimoe/aglet/internal/diff"
+	"github.com/zhimoe/aglet/internal/permissions"
 )
 
 const (
@@ -44,6 +47,7 @@ type writeFileArgs struct {
 type writeFileResult struct {
 	Path  string `json:"path"`
 	Bytes int    `json:"bytes"`
+	Diff  string `json:"diff,omitempty"`
 }
 
 type editFileArgs struct {
@@ -56,6 +60,7 @@ type editFileArgs struct {
 type editFileResult struct {
 	Path         string `json:"path"`
 	Replacements int    `json:"replacements"`
+	Diff         string `json:"diff,omitempty"`
 }
 
 type listDirArgs struct {
@@ -143,12 +148,22 @@ func newReadFileTool(deps Deps) (tool.Tool, error) {
 
 func newWriteFileTool(deps Deps) (tool.Tool, error) {
 	handler := func(ctx adkagent.Context, args writeFileArgs) (writeFileResult, error) {
-		summary := fmt.Sprintf("Write %d bytes to %s", len(args.Content), args.Path)
-		if err := authorize(ctx, deps, "write_file", summary, map[string]any{"path": args.Path, "content": args.Content}); err != nil {
-			return writeFileResult{}, err
-		}
 		abs, err := resolvePath(deps.Workspace, args.Path)
 		if err != nil {
+			return writeFileResult{}, err
+		}
+		oldText := ""
+		if data, err := os.ReadFile(abs); err == nil {
+			oldText = string(data)
+		}
+		diffText := diffutil.Unified(args.Path, oldText, args.Content, 3)
+		summary := fmt.Sprintf("Write %d bytes to %s", len(args.Content), args.Path)
+		if err := authorizeRequest(ctx, deps, permissions.ApprovalRequest{
+			ToolName: "write_file",
+			Summary:  summary,
+			Args:     map[string]any{"path": args.Path, "content": args.Content},
+			Diff:     diffText,
+		}); err != nil {
 			return writeFileResult{}, err
 		}
 		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
@@ -157,7 +172,7 @@ func newWriteFileTool(deps Deps) (tool.Tool, error) {
 		if err := os.WriteFile(abs, []byte(args.Content), 0o644); err != nil {
 			return writeFileResult{}, err
 		}
-		return writeFileResult{Path: args.Path, Bytes: len(args.Content)}, nil
+		return writeFileResult{Path: args.Path, Bytes: len(args.Content), Diff: diffText}, nil
 	}
 	return functiontool.New(functiontool.Config{
 		Name:        "write_file",
@@ -169,12 +184,6 @@ func newEditFileTool(deps Deps) (tool.Tool, error) {
 	handler := func(ctx adkagent.Context, args editFileArgs) (editFileResult, error) {
 		if args.OldString == "" {
 			return editFileResult{}, fmt.Errorf("old_string must not be empty")
-		}
-		summary := fmt.Sprintf("Edit %s (replace %q)", args.Path, short(args.OldString, 80))
-		if err := authorize(ctx, deps, "edit_file", summary, map[string]any{
-			"path": args.Path, "old_string": args.OldString, "new_string": args.NewString,
-		}); err != nil {
-			return editFileResult{}, err
 		}
 		abs, err := resolvePath(deps.Workspace, args.Path)
 		if err != nil {
@@ -193,10 +202,22 @@ func newEditFileTool(deps Deps) (tool.Tool, error) {
 			return editFileResult{}, fmt.Errorf("old_string occurs %d times in %s; pass replace_all=true or provide a more specific string", count, args.Path)
 		}
 		updated := strings.ReplaceAll(text, args.OldString, args.NewString)
+		diffText := diffutil.Unified(args.Path, text, updated, 3)
+		summary := fmt.Sprintf("Edit %s (replace %q)", args.Path, short(args.OldString, 80))
+		if err := authorizeRequest(ctx, deps, permissions.ApprovalRequest{
+			ToolName: "edit_file",
+			Summary:  summary,
+			Args: map[string]any{
+				"path": args.Path, "old_string": args.OldString, "new_string": args.NewString,
+			},
+			Diff: diffText,
+		}); err != nil {
+			return editFileResult{}, err
+		}
 		if err := os.WriteFile(abs, []byte(updated), 0o644); err != nil {
 			return editFileResult{}, err
 		}
-		return editFileResult{Path: args.Path, Replacements: count}, nil
+		return editFileResult{Path: args.Path, Replacements: count, Diff: diffText}, nil
 	}
 	return functiontool.New(functiontool.Config{
 		Name:        "edit_file",

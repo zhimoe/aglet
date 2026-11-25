@@ -14,8 +14,10 @@ const AppName = "aglet"
 // Config is the on-disk configuration format.
 type Config struct {
 	DefaultProfile string                     `json:"default_profile"`
+	ApprovalMode   string                     `json:"approval_mode"`
 	Profiles       map[string]Profile         `json:"profiles"`
 	Agent          AgentConfig                `json:"agent"`
+	Context        ContextConfig              `json:"context"`
 	Workspace      string                     `json:"workspace"`
 	Permissions    PermissionsConfig          `json:"permissions"`
 	MCPServers     map[string]MCPServerConfig `json:"mcp_servers"`
@@ -33,9 +35,52 @@ type Profile struct {
 }
 
 type AgentConfig struct {
-	MaxLLMCalls      int     `json:"max_llm_calls"`
-	Temperature      float32 `json:"temperature"`
-	SystemPromptFile string  `json:"system_prompt_file"`
+	MaxLLMCalls      int              `json:"max_llm_calls"`
+	Temperature      float32          `json:"temperature"`
+	SystemPromptFile string           `json:"system_prompt_file"`
+	Compaction       CompactionConfig `json:"compaction"`
+}
+
+type CompactionConfig struct {
+	TokenThreshold     int `json:"token_threshold"`
+	EventRetentionSize int `json:"event_retention_size"`
+	CompactionInterval int `json:"compaction_interval"`
+	OverlapSize        int `json:"overlap_size"`
+}
+
+type ContextConfig struct {
+	InstructionFiles    []string `json:"instruction_files"`
+	SkillsDirs          []string `json:"skills_dirs"`
+	SkillsEnabled       *bool    `json:"skills_enabled"`
+	MaxInstructionBytes int      `json:"max_instruction_bytes"`
+	MaxSkillBytes       int      `json:"max_skill_bytes"`
+}
+
+func (c ContextConfig) SkillsEnabledValue() bool {
+	return c.SkillsEnabled == nil || *c.SkillsEnabled
+}
+
+// ApprovalMode constants and aliases.
+const (
+	ApprovalAsk      = "ask"
+	ApprovalReadOnly = "read-only"
+	ApprovalAutoEdit = "auto-edit"
+	ApprovalFullAuto = "full-auto"
+)
+
+func NormalizeApprovalMode(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "ask", "default":
+		return ApprovalAsk
+	case "read-only", "readonly", "plan":
+		return ApprovalReadOnly
+	case "auto-edit", "autoedit", "accept-edits", "acceptedits":
+		return ApprovalAutoEdit
+	case "full-auto", "fullauto", "auto", "yolo":
+		return ApprovalFullAuto
+	default:
+		return s
+	}
 }
 
 type PermissionsConfig struct {
@@ -93,14 +138,21 @@ func Defaults() *Config {
 				Model:     "deepseek-flash",
 			},
 		},
+		ApprovalMode: ApprovalAsk,
 		Agent: AgentConfig{
 			MaxLLMCalls: 50,
 			Temperature: 0.2,
 		},
+		Context: ContextConfig{
+			InstructionFiles:    []string{"AGLET.md", "AGENTS.md", "AGENTS.override.md", "CLAUDE.md"},
+			SkillsDirs:          []string{".agents/skills", ".aglet/skills", "~/.agents/skills", "~/.config/aglet/skills"},
+			MaxInstructionBytes: 32 * 1024,
+			MaxSkillBytes:       64 * 1024,
+		},
 		Workspace: ".",
 		Permissions: PermissionsConfig{
-			AutoApprove:     []string{"read_file", "list_dir", "glob", "grep"},
-			RequireApproval: []string{"write_file", "edit_file", "run_command", "mcp_*"},
+			AutoApprove:     []string{"read_file", "list_dir", "glob", "grep", "git_status", "git_diff", "git_log", "load_skill", "update_plan"},
+			RequireApproval: []string{"write_file", "edit_file", "run_command", "git_commit", "mcp_*"},
 		},
 		SessionDB:  "~/.local/share/aglet/sessions.db",
 		UI:         UIConfig{ShowThoughts: &showThoughts},
@@ -146,11 +198,32 @@ func ApplyDefaults(cfg *Config) {
 		}
 		cfg.Profiles[name] = p
 	}
+	if cfg.ApprovalMode == "" {
+		cfg.ApprovalMode = d.ApprovalMode
+	} else {
+		cfg.ApprovalMode = NormalizeApprovalMode(cfg.ApprovalMode)
+	}
 	if cfg.Agent.MaxLLMCalls == 0 {
 		cfg.Agent.MaxLLMCalls = d.Agent.MaxLLMCalls
 	}
 	if cfg.Agent.Temperature == 0 {
 		cfg.Agent.Temperature = d.Agent.Temperature
+	}
+	if cfg.Context.InstructionFiles == nil {
+		cfg.Context.InstructionFiles = d.Context.InstructionFiles
+	}
+	if cfg.Context.SkillsDirs == nil {
+		cfg.Context.SkillsDirs = d.Context.SkillsDirs
+	}
+	if cfg.Context.SkillsEnabled == nil {
+		enabled := true
+		cfg.Context.SkillsEnabled = &enabled
+	}
+	if cfg.Context.MaxInstructionBytes <= 0 {
+		cfg.Context.MaxInstructionBytes = d.Context.MaxInstructionBytes
+	}
+	if cfg.Context.MaxSkillBytes <= 0 {
+		cfg.Context.MaxSkillBytes = d.Context.MaxSkillBytes
 	}
 	if cfg.Workspace == "" {
 		cfg.Workspace = d.Workspace
@@ -202,6 +275,33 @@ func ApplyDefaults(cfg *Config) {
 }
 
 func (c *Config) Validate() error {
+	switch c.ApprovalMode {
+	case ApprovalAsk, ApprovalReadOnly, ApprovalAutoEdit, ApprovalFullAuto:
+	default:
+		return fmt.Errorf("config: approval_mode %q is invalid (want ask, read-only, auto-edit or full-auto)", c.ApprovalMode)
+	}
+	comp := c.Agent.Compaction
+	if comp.TokenThreshold < 0 || comp.EventRetentionSize < 0 || comp.CompactionInterval < 0 || comp.OverlapSize < 0 {
+		return fmt.Errorf("config: agent.compaction values must be non-negative")
+	}
+	if comp.TokenThreshold == 0 && comp.CompactionInterval == 0 {
+		if comp.EventRetentionSize > 0 || comp.OverlapSize > 0 {
+			return fmt.Errorf("config: agent.compaction needs token_threshold or compaction_interval to enable a strategy")
+		}
+	} else {
+		if comp.TokenThreshold > 0 && comp.EventRetentionSize <= 0 {
+			return fmt.Errorf("config: agent.compaction.event_retention_size must be > 0 when token_threshold is set")
+		}
+		if comp.EventRetentionSize > 0 && comp.TokenThreshold == 0 {
+			return fmt.Errorf("config: agent.compaction.event_retention_size requires token_threshold")
+		}
+		if comp.OverlapSize > 0 && comp.CompactionInterval == 0 {
+			return fmt.Errorf("config: agent.compaction.overlap_size requires compaction_interval")
+		}
+		if comp.CompactionInterval > 0 && comp.EventRetentionSize > 0 && comp.CompactionInterval < comp.EventRetentionSize {
+			return fmt.Errorf("config: agent.compaction.compaction_interval should be >= event_retention_size")
+		}
+	}
 	if len(c.Profiles) == 0 {
 		return fmt.Errorf("config: profiles must not be empty")
 	}
@@ -325,6 +425,7 @@ func fileExists(p string) bool {
 // ExampleJSON is written by `aglet config init`.
 const ExampleJSON = `{
   "default_profile": "deepseek",
+  "approval_mode": "ask",
   "profiles": {
     "openai": {
       "api": "chat_completions",
@@ -342,12 +443,25 @@ const ExampleJSON = `{
   "agent": {
     "max_llm_calls": 50,
     "temperature": 0.2,
-    "system_prompt_file": ""
+    "system_prompt_file": "",
+    "compaction": {
+      "token_threshold": 0,
+      "event_retention_size": 0,
+      "compaction_interval": 0,
+      "overlap_size": 0
+    }
+  },
+  "context": {
+    "instruction_files": ["AGLET.md", "AGENTS.md", "AGENTS.override.md", "CLAUDE.md"],
+    "skills_dirs": [".agents/skills", ".aglet/skills", "~/.agents/skills", "~/.config/aglet/skills"],
+    "skills_enabled": true,
+    "max_instruction_bytes": 32768,
+    "max_skill_bytes": 65536
   },
   "workspace": ".",
   "permissions": {
-    "auto_approve": ["read_file", "list_dir", "glob", "grep"],
-    "require_approval": ["write_file", "edit_file", "run_command", "mcp_*"],
+    "auto_approve": ["read_file", "list_dir", "glob", "grep", "git_status", "git_diff", "git_log", "load_skill", "update_plan"],
+    "require_approval": ["write_file", "edit_file", "run_command", "git_commit", "mcp_*"],
     "deny": []
   },
   "mcp_servers": {

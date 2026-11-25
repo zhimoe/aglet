@@ -78,6 +78,12 @@ func (a *Approver) Approve(ctx context.Context, req permissions.ApprovalRequest)
 			fmt.Fprintln(a.opts.Err, "  "+strings.ReplaceAll(s, "\n", "\n  "))
 		}
 	}
+	if req.Diff != "" {
+		fmt.Fprintln(a.opts.Err, "  diff:")
+		for _, line := range strings.Split(strings.TrimRight(req.Diff, "\n"), "\n") {
+			fmt.Fprintln(a.opts.Err, "    "+line)
+		}
+	}
 	fmt.Fprint(a.opts.Err, "Allow? [y]es once / [n]o / [a]lways this session: ")
 	line, err := a.rd.ReadString('\n')
 	if err != nil && len(line) == 0 {
@@ -133,6 +139,11 @@ func Run(ctx context.Context, rt *agent.Runtime, prompt string, opts Options) er
 			if ev.Err != nil {
 				fmt.Fprintf(opts.Err, "[error] %v\n", ev.Err)
 			}
+		case agent.EventPlan:
+			fmt.Fprintln(opts.Err, "[plan]")
+			for i, step := range ev.Plan {
+				fmt.Fprintf(opts.Err, "  %d. [%s] %s\n", i+1, step.Status, step.Step)
+			}
 		}
 	}
 	err := rt.Run(ctx, prompt, emit)
@@ -166,6 +177,9 @@ func eventJSON(ev agent.Event) map[string]any {
 	}
 	if ev.Err != nil {
 		m["error"] = ev.Err.Error()
+	}
+	if len(ev.Plan) > 0 {
+		m["plan"] = ev.Plan
 	}
 	return m
 }
