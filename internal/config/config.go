@@ -90,7 +90,7 @@ func Defaults() *Config {
 				API:       "chat_completions",
 				BaseURL:   "https://api.deepseek.com",
 				APIKeyEnv: "DEEPSEEK_API_KEY",
-				Model:     "deepseek-chat",
+				Model:     "deepseek-flash",
 			},
 		},
 		Agent: AgentConfig{
@@ -336,7 +336,7 @@ const ExampleJSON = `{
       "api": "chat_completions",
       "base_url": "https://api.deepseek.com",
       "api_key_env": "DEEPSEEK_API_KEY",
-      "model": "deepseek-chat"
+      "model": "deepseek-flash"
     }
   },
   "agent": {

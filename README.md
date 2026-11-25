@@ -86,8 +86,10 @@ export OPENAI_API_KEY=sk-...
 
 ### Headless
 
-> Tested against DeepSeek `deepseek-flash` through the OpenAI-compatible Chat
-> Completions endpoint, including a tool call round trip.
+> Tested against DeepSeek `deepseek-flash` (including a tool call round trip)
+> and `deepseek-v4-pro` (basic chat) through the OpenAI-compatible Chat
+> Completions endpoint. Model names change over time; set what your provider
+> actually exposes.
 
 ```bash
 ./aglet run --profile deepseek "list the files in this repo and explain go.mod"
@@ -133,7 +135,7 @@ A minimal config:
       "api": "chat_completions",
       "base_url": "https://api.deepseek.com",
       "api_key_env": "DEEPSEEK_API_KEY",
-      "model": "deepseek-chat"
+      "model": "deepseek-flash"
     },
     "openai": {
       "api": "chat_completions",
