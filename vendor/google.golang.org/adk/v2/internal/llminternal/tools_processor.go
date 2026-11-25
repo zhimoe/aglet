@@ -1,0 +1,51 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package llminternal
+
+import (
+	"fmt"
+	"iter"
+	"slices"
+
+	"google.golang.org/adk/v2/agent"
+	icontext "google.golang.org/adk/v2/internal/context"
+	"google.golang.org/adk/v2/model"
+	"google.golang.org/adk/v2/session"
+)
+
+// toolProcessor populates f.Tools on every step by re-evaluating each
+// Toolset. Toolsets may return different tools based on session state that
+// was modified by an earlier step in the same Run(), so the tool list must
+// be rebuilt before each model call rather than being cached across steps.
+func toolProcessor(ctx agent.InvocationContext, req *model.LLMRequest, f *Flow) iter.Seq2[*session.Event, error] {
+	return func(yield func(*session.Event, error) bool) {
+		llmAgent, ok := ctx.Agent().(Agent)
+		if !ok {
+			yield(nil, fmt.Errorf("agent %v is not an LLMAgent", ctx.Agent().Name()))
+			return
+		}
+		tools := slices.Clip(Reveal(llmAgent).Tools)
+		for _, toolSet := range Reveal(llmAgent).Toolsets {
+			tsTools, err := toolSet.Tools(icontext.NewReadonlyContext(ctx))
+			if err != nil {
+				yield(nil, fmt.Errorf("failed to extract tools from the tool set %q: %w", toolSet.Name(), err))
+				return
+			}
+
+			tools = append(tools, tsTools...)
+		}
+		f.Tools = tools
+	}
+}

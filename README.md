@@ -19,7 +19,9 @@ A small terminal coding agent built with **Google ADK for Go v2** and **Bubble T
 ## Requirements
 
 - Go **1.26.10+** (developed with Go 1.27.4)
-- macOS or Linux (the shell tool uses `sh`; process-group cancellation is Unix-specific)
+- macOS, Linux, or Windows
+  - Unix shell tool uses `sh -c`; Windows uses `cmd.exe /C`.
+  - Unix cancellation kills the process group; Windows uses `taskkill /T /F`.
 - An API key for an OpenAI-compatible provider
 
 ## Build
@@ -40,6 +42,34 @@ CGO_ENABLED=0 go build -o aglet ./cmd/aglet
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o aglet-linux ./cmd/aglet
 ```
 
+### Windows
+
+The repository includes `vendor/`, so a Windows build can run offline with
+`-mod=vendor`.
+
+From PowerShell:
+
+```powershell
+.\scripts\build-windows.ps1              # dist\aglet-windows-amd64.exe
+.\scripts\build-windows.ps1 -Arch arm64  # dist\aglet-windows-arm64.exe
+.\scripts\build-windows.ps1 -Strip       # smaller binary (-s -w)
+```
+
+From `cmd.exe`:
+
+```bat
+scripts\build-windows.cmd
+```
+
+Or cross-compile from macOS/Linux:
+
+```bash
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -mod=vendor -trimpath -o dist/aglet-windows-amd64.exe ./cmd/aglet
+```
+
+The Windows build is pure Go (`CGO_ENABLED=0`). `run_command` uses `cmd.exe`
+syntax on Windows, not POSIX shell syntax.
+
 ## Quick start
 
 ```bash
@@ -55,6 +85,9 @@ export OPENAI_API_KEY=sk-...
 ```
 
 ### Headless
+
+> Tested against DeepSeek `deepseek-flash` through the OpenAI-compatible Chat
+> Completions endpoint, including a tool call round trip.
 
 ```bash
 ./aglet run --profile deepseek "list the files in this repo and explain go.mod"
@@ -181,7 +214,7 @@ MCP tools are exposed as `mcp_<server>_<tool>` (sanitized, max 64 characters). T
 - File tools are restricted to the workspace, including symlink escape checks.
 - Writes, edits, commands, and MCP tools require confirmation by default.
 - In headless mode, non-TTY stdin denies sensitive tools unless `--yes` is passed. Use `--deny` to force rejection.
-- `run_command` has a default 120s timeout (max 600s), truncates output, and kills the process group on cancellation.
+- `run_command` has a default 120s timeout (max 600s), truncates output, and kills the process group on cancellation. On Windows it uses `cmd.exe /C` and `taskkill /T /F`.
 - No OS-level sandbox is provided. Run `aglet` in a dedicated directory or container when working with untrusted code, and avoid `--yes` there.
 
 ## Architecture
@@ -228,5 +261,6 @@ Tests cover event mapping, a fake-model runtime + tool loop, config validation/r
 - MCP resources/prompts and runtime reload are not implemented; only tools are discovered.
 - Sessions work across processes, but there is no session list UI yet.
 - No OS sandbox; approval and workspace checks are the current boundary.
+- The Windows target is cross-compiled and compile-checked here; it has not been run on a real Windows machine in this repo's test setup. Please run `go test ./...` and a quick `aglet run` on Windows before relying on it.
 
 These are deliberate next steps rather than hidden behavior. The skeleton is meant to be small enough to read and extend.

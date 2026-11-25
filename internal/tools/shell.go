@@ -87,7 +87,7 @@ func newRunCommandTool(deps Deps) (tool.Tool, error) {
 		runCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		cmd := exec.CommandContext(runCtx, "sh", "-c", args.Command)
+		cmd := newShellCommand(runCtx, args.Command)
 		cmd.Dir = dir
 		cmd.Env = os.Environ()
 		out := &limitedBuffer{limit: maxCommandOutput}
