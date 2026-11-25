@@ -1,0 +1,43 @@
+{
+  "default_profile": "deepseek",
+  "profiles": {
+    "openai": {
+      "api": "chat_completions",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "model": "gpt-4.1"
+    },
+    "deepseek": {
+      "api": "chat_completions",
+      "base_url": "https://api.deepseek.com",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "model": "deepseek-chat"
+    }
+  },
+  "agent": {
+    "max_llm_calls": 50,
+    "temperature": 0.2,
+    "system_prompt_file": ""
+  },
+  "workspace": ".",
+  "permissions": {
+    "auto_approve": ["read_file", "list_dir", "glob", "grep"],
+    "require_approval": ["write_file", "edit_file", "run_command", "mcp_*"],
+    "deny": []
+  },
+  "mcp_servers": {
+    "everything": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"],
+      "env": {},
+      "enabled": false,
+      "require_confirmation": true,
+      "connect_timeout_sec": 10
+    }
+  },
+  "session_db": "~/.local/share/aglet/sessions.db",
+  "ui": {
+    "show_thoughts": true
+  }
+}
