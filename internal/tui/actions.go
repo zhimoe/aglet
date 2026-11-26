@@ -98,7 +98,7 @@ func gitDiffCmd(workspace string) tea.Cmd {
 func startShellRun(rt *agent.Runtime, command string, run int, ctx context.Context) <-chan shellEvent {
 	ch := make(chan shellEvent, 1)
 	go func() {
-		res, err := rt.RunShell(ctx, command)
+		res, err := rt.RunShellWithHooks(ctx, command)
 		ev := shellEvent{
 			run: run, command: command, output: res.Stdout,
 			exitCode: res.ExitCode, timedOut: res.TimedOut, err: err,

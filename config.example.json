@@ -29,15 +29,35 @@
   "context": {
     "instruction_files": ["AGLET.md", "AGENTS.md", "AGENTS.override.md", "CLAUDE.md"],
     "skills_dirs": [".agents/skills", ".aglet/skills", "~/.agents/skills", "~/.config/aglet/skills"],
+    "agents_dirs": [".aglet/agents", ".agents/agents", "~/.config/aglet/agents"],
+    "commands_dirs": [".aglet/commands", ".agents/commands", "~/.config/aglet/commands"],
     "skills_enabled": true,
     "max_instruction_bytes": 32768,
     "max_skill_bytes": 65536
   },
   "workspace": ".",
   "permissions": {
-    "auto_approve": ["read_file", "list_dir", "glob", "grep", "git_status", "git_diff", "git_log", "load_skill", "update_plan"],
+    "auto_approve": ["read_file", "list_dir", "glob", "grep", "git_status", "git_diff", "git_log", "load_skill", "update_plan", "task", "web_fetch", "web_search", "bash_output", "kill_shell"],
     "require_approval": ["write_file", "edit_file", "run_command", "git_commit", "mcp_*"],
     "deny": []
+  },
+  "hooks": {},
+  "web": {
+    "fetch": {
+      "enabled": true,
+      "max_bytes": 1048576,
+      "timeout_sec": 30,
+      "allow_private_networks": false,
+      "allowed_hosts": []
+    },
+    "search": {
+      "enabled": false,
+      "provider": "tavily",
+      "base_url": "",
+      "api_key_env": "TAVILY_API_KEY",
+      "max_results": 5,
+      "timeout_sec": 20
+    }
   },
   "mcp_servers": {
     "everything": {

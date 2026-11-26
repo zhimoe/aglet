@@ -171,6 +171,9 @@ func (m *Model) renderApproval() string {
 	if req.Server != "" {
 		fmt.Fprintf(&head, "  (server: %s)", req.Server)
 	}
+	if req.Agent != "" && req.Agent != "aglet" {
+		fmt.Fprintf(&head, "  (from %s)", req.Agent)
+	}
 	if req.Summary != "" {
 		head.WriteString("\n" + req.Summary)
 	}

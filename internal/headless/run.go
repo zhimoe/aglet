@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/zhimoe/aglet/internal/agent"
 	"github.com/zhimoe/aglet/internal/permissions"
@@ -41,6 +42,7 @@ func (o *Options) normalize() {
 type Approver struct {
 	opts Options
 	rd   *bufio.Reader
+	mu   sync.Mutex
 }
 
 func NewApprover(opts Options) *Approver {
@@ -61,9 +63,14 @@ func (a *Approver) Approve(ctx context.Context, req permissions.ApprovalRequest)
 	if err := ctx.Err(); err != nil {
 		return permissions.DecisionDeny, err
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	fmt.Fprintf(a.opts.Err, "\n[approval] %s", req.ToolName)
 	if req.Server != "" {
 		fmt.Fprintf(a.opts.Err, " (%s)", req.Server)
+	}
+	if req.Agent != "" && req.Agent != "aglet" {
+		fmt.Fprintf(a.opts.Err, " from %s", req.Agent)
 	}
 	fmt.Fprintln(a.opts.Err)
 	if req.Summary != "" {
@@ -144,6 +151,8 @@ func Run(ctx context.Context, rt *agent.Runtime, prompt string, opts Options) er
 			for i, step := range ev.Plan {
 				fmt.Fprintf(opts.Err, "  %d. [%s] %s\n", i+1, step.Status, step.Step)
 			}
+		case agent.EventNotice:
+			fmt.Fprintf(opts.Err, "[notice] %s\n", ev.Text)
 		}
 	}
 	err := rt.Run(ctx, prompt, emit)

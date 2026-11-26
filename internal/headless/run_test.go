@@ -52,6 +52,17 @@ func TestEventJSONPlan(t *testing.T) {
 	}
 }
 
+func TestEventJSONNotice(t *testing.T) {
+	b, err := json.Marshal(eventJSON(agent.Event{Type: agent.EventNotice, Text: "hello"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	if !strings.Contains(s, `"type":"notice"`) || !strings.Contains(s, `"text":"hello"`) {
+		t.Fatalf("json = %s", s)
+	}
+}
+
 func TestApproverTTYPrompt(t *testing.T) {
 	a := NewApprover(Options{
 		TTY: true,

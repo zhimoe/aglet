@@ -5,8 +5,10 @@ package tools
 import (
 	"context"
 	"os/exec"
+
+	"github.com/zhimoe/aglet/internal/proc"
 )
 
 func newShellCommand(ctx context.Context, command string) *exec.Cmd {
-	return exec.CommandContext(ctx, "sh", "-c", command)
+	return proc.Command(ctx, command)
 }

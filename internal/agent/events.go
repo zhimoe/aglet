@@ -21,6 +21,7 @@ const (
 	EventError      EventType = "error"
 	EventDone       EventType = "done"
 	EventPlan       EventType = "plan"
+	EventNotice     EventType = "notice"
 )
 
 type Event struct {

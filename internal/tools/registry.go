@@ -7,6 +7,7 @@ import (
 
 	"google.golang.org/adk/v2/tool"
 
+	"github.com/zhimoe/aglet/internal/config"
 	"github.com/zhimoe/aglet/internal/permissions"
 	"github.com/zhimoe/aglet/internal/plan"
 	"github.com/zhimoe/aglet/internal/skills"
@@ -19,6 +20,8 @@ type Deps struct {
 	Approver  permissions.Approver
 	Plan      *plan.Board
 	Skills    []skills.Skill
+	Jobs      *JobManager
+	Web       config.WebConfig
 }
 
 // NewLocalTools constructs the built-in local tool set.
@@ -40,12 +43,20 @@ func NewLocalTools(deps Deps) ([]tool.Tool, error) {
 		newGlobTool,
 		newGrepTool,
 		newRunCommandTool,
+		newBashOutputTool,
+		newKillShellTool,
 		newLoadSkillTool,
 		newUpdatePlanTool,
 		newGitStatusTool,
 		newGitDiffTool,
 		newGitLogTool,
 		newGitCommitTool,
+	}
+	if deps.Web.FetchEnabledValue() {
+		builders = append(builders, newWebFetchTool)
+	}
+	if deps.Web.SearchEnabledValue() {
+		builders = append(builders, newWebSearchTool)
 	}
 	out := make([]tool.Tool, 0, len(builders))
 	for _, build := range builders {
@@ -69,6 +80,11 @@ func authorize(ctx context.Context, deps Deps, toolName, summary string, args ma
 func authorizeRequest(ctx context.Context, deps Deps, req permissions.ApprovalRequest) error {
 	if deps.Policy == nil {
 		return nil
+	}
+	if req.Agent == "" {
+		if named, ok := ctx.(interface{ AgentName() string }); ok {
+			req.Agent = named.AgentName()
+		}
 	}
 	return deps.Policy.Authorize(ctx, req, deps.Approver)
 }

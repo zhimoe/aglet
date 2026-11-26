@@ -68,6 +68,21 @@ func TestPolicyPrecedenceAndSessionGrant(t *testing.T) {
 	}
 }
 
+func TestPhase3ReadOnlyTools(t *testing.T) {
+	ro := NewPolicy(config.PermissionsConfig{}, config.ApprovalReadOnly)
+	for _, tool := range []string{"task", "web_fetch", "web_search", "bash_output", "kill_shell"} {
+		if err := ro.Authorize(context.Background(), req(tool), nil); err != nil {
+			t.Fatalf("read-only should allow %s: %v", tool, err)
+		}
+	}
+	auto := NewPolicy(config.PermissionsConfig{}, config.ApprovalAutoEdit)
+	for _, tool := range []string{"task", "web_fetch", "web_search", "bash_output", "kill_shell"} {
+		if err := auto.Authorize(context.Background(), req(tool), nil); err != nil {
+			t.Fatalf("auto-edit should allow %s: %v", tool, err)
+		}
+	}
+}
+
 func TestApprovalModes(t *testing.T) {
 	cfg := config.PermissionsConfig{
 		AutoApprove:     []string{"read_file"},

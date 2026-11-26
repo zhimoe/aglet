@@ -5,26 +5,29 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"strings"
 	"sync"
+	"time"
 
 	adkagent "google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
 	"google.golang.org/adk/v2/model"
-	"google.golang.org/adk/v2/model/openaimodel"
+	"google.golang.org/adk/v2/plugin"
 	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session/compaction"
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/genai"
 
+	"github.com/zhimoe/aglet/internal/commands"
 	"github.com/zhimoe/aglet/internal/config"
+	"github.com/zhimoe/aglet/internal/hooks"
 	"github.com/zhimoe/aglet/internal/instructions"
-	"github.com/zhimoe/aglet/internal/mcp"
+	mcpmanager "github.com/zhimoe/aglet/internal/mcp"
 	"github.com/zhimoe/aglet/internal/permissions"
 	"github.com/zhimoe/aglet/internal/plan"
 	sessionstore "github.com/zhimoe/aglet/internal/session"
 	"github.com/zhimoe/aglet/internal/skills"
+	"github.com/zhimoe/aglet/internal/subagents"
 	"github.com/zhimoe/aglet/internal/tools"
 )
 
@@ -48,15 +51,37 @@ type Runtime struct {
 	cfg       *config.Config
 	profile   string
 	modelName string
+	llm       model.LLM
+	testLLM   model.LLM
 	userID    string
 	appName   string
 	runner    *runner.Runner
 	store     *sessionstore.Store
-	mcp       *mcp.Manager
+	mcp       *mcpmanager.Manager
 	plan      *plan.Board
-	skillList []skills.Skill
-	toolDeps  tools.Deps
+	jobs      *tools.JobManager
 	log       *slog.Logger
+
+	hookRunner     *hooks.Runner
+	hookBridge     *hookBridge
+	hookPlugin     *plugin.Plugin
+	toolHookPlugin *plugin.Plugin
+	hub            *emitterHub
+	runMu          sync.Mutex
+
+	subagentList []subagents.Definition
+	commandList  []commands.Command
+	skillList    []skills.Skill
+	instr        []instructions.Section
+	toolDeps     tools.Deps
+	genConfig    *genai.GenerateContentConfig
+	subagentSem  chan struct{}
+
+	modelMu sync.Mutex
+	models  map[string]model.LLM
+
+	closeOnce sync.Once
+	closeErr  error
 
 	mu        sync.RWMutex
 	sessionID string
@@ -71,26 +96,15 @@ func New(ctx context.Context, cfg *config.Config, opts Options) (*Runtime, error
 	if err != nil {
 		return nil, err
 	}
-	var llm model.LLM
+	var rootLLM model.LLM
+	var testLLM model.LLM
 	if opts.ModelLLM != nil {
-		llm = opts.ModelLLM
+		rootLLM = opts.ModelLLM
+		testLLM = opts.ModelLLM
 	} else {
-		apiKey := os.Getenv(profile.APIKeyEnv)
-		if apiKey == "" {
-			return nil, fmt.Errorf("environment variable %s is empty (required for profile %s)", profile.APIKeyEnv, profileName)
-		}
-		api := openaimodel.APIChatCompletions
-		if profile.API == "responses" {
-			api = openaimodel.APIResponses
-		}
-		var err error
-		llm, err = openaimodel.NewModel(ctx, profile.Model, &openaimodel.ClientConfig{
-			APIKey:  apiKey,
-			BaseURL: profile.BaseURL,
-			API:     api,
-		})
+		rootLLM, err = buildModel(profile)
 		if err != nil {
-			return nil, fmt.Errorf("create model: %w", err)
+			return nil, err
 		}
 	}
 	workspace := opts.Workspace
@@ -109,49 +123,150 @@ func New(ctx context.Context, cfg *config.Config, opts Options) (*Runtime, error
 		if err != nil {
 			return nil, fmt.Errorf("load skills: %w", err)
 		}
-		for _, warning := range warnings {
-			logger.Warn("skill warning", "detail", warning)
-		}
+		logWarnings(logger, "skill", warnings)
 	}
+	subagentList, warnings, err := subagents.Discover(workspace, cfg.Context.AgentsDirs, cfg.Context.MaxSkillBytes)
+	if err != nil {
+		return nil, fmt.Errorf("load subagents: %w", err)
+	}
+	logWarnings(logger, "subagent", warnings)
+	commandList, warnings, err := commands.Discover(workspace, cfg.Context.CommandsDirs, cfg.Context.MaxSkillBytes)
+	if err != nil {
+		return nil, fmt.Errorf("load commands: %w", err)
+	}
+	logWarnings(logger, "command", warnings)
+
 	board := plan.New()
+	jobs := tools.NewJobManager()
 	toolDeps := tools.Deps{
 		Workspace: workspace,
 		Policy:    opts.Policy,
 		Approver:  opts.Approver,
 		Plan:      board,
 		Skills:    skillList,
+		Jobs:      jobs,
+		Web:       cfg.Web,
 	}
-	localTools, err := tools.NewLocalTools(toolDeps)
-	if err != nil {
+
+	var store *sessionstore.Store
+	var mcpManager *mcpmanager.Manager
+	fail := func(err error) (*Runtime, error) {
+		if mcpManager != nil {
+			_ = mcpManager.Close()
+		}
+		_ = jobs.Close()
+		if store != nil {
+			_ = store.Close()
+		}
 		return nil, err
 	}
-	mcpManager, err := mcp.New(ctx, cfg.MCPServers, opts.Policy, opts.Approver, cfg.StrictMCP, logger)
+
+	store, err = sessionstore.Open(cfg.SessionDB, config.AppName, "local")
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
-	prompt, err := BuildSystemPrompt(cfg, workspace, instr, skillList)
+	desired := opts.SessionID
+	if desired == "" && opts.Continue {
+		infos, err := store.List(ctx)
+		if err != nil {
+			return fail(err)
+		}
+		if len(infos) > 0 {
+			desired = infos[len(infos)-1].ID
+		}
+	}
+	source := "startup"
+	if desired != "" {
+		if _, err := store.Get(ctx, desired); err == nil {
+			source = "resume"
+		}
+	}
+	sessionID, err := store.Ensure(ctx, desired)
 	if err != nil {
-		_ = mcpManager.Close()
-		return nil, err
+		return fail(err)
+	}
+
+	rt := &Runtime{
+		cfg:          cfg,
+		profile:      profileName,
+		modelName:    profile.Model,
+		llm:          rootLLM,
+		testLLM:      testLLM,
+		userID:       "local",
+		appName:      config.AppName,
+		store:        store,
+		plan:         board,
+		jobs:         jobs,
+		log:          logger,
+		hub:          newEmitterHub(),
+		subagentList: subagentList,
+		commandList:  commandList,
+		skillList:    skillList,
+		instr:        instr,
+		toolDeps:     toolDeps,
+		subagentSem:  make(chan struct{}, 4),
+		models:       map[string]model.LLM{},
+		sessionID:    sessionID,
+	}
+	rt.hookRunner = hooks.New(cfg.Hooks, hooks.Options{
+		Workspace:      workspace,
+		SessionID:      rt.SessionID,
+		PermissionMode: rt.ApprovalMode,
+		Logger:         logger,
+	})
+	rt.hookBridge = newHookBridge(rt.hookRunner, rt.hub)
+	start := rt.hookRunner.Run(ctx, config.HookSessionStart, hooks.Input{Source: source})
+	for _, msg := range start.SystemMessages {
+		rt.hub.Notice(msg)
+	}
+	for _, msg := range start.Warnings {
+		logger.Warn("hook warning", "detail", msg)
+	}
+
+	prompt, err := BuildSystemPrompt(cfg, workspace, instr, skillList, subagentList, start.AdditionalContext)
+	if err != nil {
+		return fail(err)
 	}
 	comp, err := buildCompaction(cfg.Agent.Compaction)
 	if err != nil {
-		_ = mcpManager.Close()
-		return nil, err
+		return fail(err)
 	}
-	adkTools := make([]tool.Tool, 0, len(localTools)+len(mcpManager.Tools()))
-	adkTools = append(adkTools, localTools...)
-	adkTools = append(adkTools, mcpManager.Tools()...)
-
 	genCfg := &genai.GenerateContentConfig{}
 	if cfg.Agent.Temperature > 0 {
 		t := cfg.Agent.Temperature
 		genCfg.Temperature = &t
 	}
+	rt.genConfig = genCfg
+
+	mainPlugin, toolPlugin, err := rt.hookBridge.plugins()
+	if err != nil {
+		return fail(err)
+	}
+	rt.hookPlugin = mainPlugin
+	rt.toolHookPlugin = toolPlugin
+
+	localTools, err := tools.NewLocalTools(toolDeps)
+	if err != nil {
+		return fail(err)
+	}
+	mcpManager, err = mcpmanager.New(ctx, cfg.MCPServers, opts.Policy, opts.Approver, cfg.StrictMCP, logger)
+	if err != nil {
+		return fail(err)
+	}
+	rt.mcp = mcpManager
+	adkTools := make([]tool.Tool, 0, len(localTools)+len(mcpManager.Tools())+1)
+	adkTools = append(adkTools, localTools...)
+	adkTools = append(adkTools, mcpManager.Tools()...)
+	taskTool, err := newTaskTool(rt)
+	if err != nil {
+		return fail(err)
+	}
+	adkTools = append(adkTools, taskTool)
+
 	a, err := llmagent.New(llmagent.Config{
-		Name:        "aglet",
-		Description: "A terminal coding agent with filesystem, shell and MCP tools.",
-		Model:       llm,
+		Name:        rootAgentName,
+		Description: "A terminal coding agent with filesystem, shell, MCP, web and subagent tools.",
+		Model:       rootLLM,
 		InstructionProvider: func(adkagent.ReadonlyContext) (string, error) {
 			return prompt, nil
 		},
@@ -159,59 +274,33 @@ func New(ctx context.Context, cfg *config.Config, opts Options) (*Runtime, error
 		GenerateContentConfig: genCfg,
 	})
 	if err != nil {
-		_ = mcpManager.Close()
-		return nil, fmt.Errorf("create agent: %w", err)
+		return fail(fmt.Errorf("create agent: %w", err))
 	}
-	store, err := sessionstore.Open(cfg.SessionDB, config.AppName, "local")
-	if err != nil {
-		_ = mcpManager.Close()
-		return nil, err
-	}
-	desired := opts.SessionID
-	if desired == "" && opts.Continue {
-		infos, err := store.List(ctx)
-		if err != nil {
-			_ = store.Close()
-			_ = mcpManager.Close()
-			return nil, err
-		}
-		if len(infos) > 0 {
-			desired = infos[len(infos)-1].ID
-		}
-	}
-	sessionID, err := store.Ensure(ctx, desired)
-	if err != nil {
-		_ = store.Close()
-		_ = mcpManager.Close()
-		return nil, err
-	}
-	runnerCfg := runner.Config{
+	r, err := runner.New(runner.Config{
 		AppName:        config.AppName,
 		Agent:          a,
 		SessionService: store.Service,
 		Compaction:     comp,
-	}
-	r, err := runner.New(runnerCfg)
+		PluginConfig:   runner.PluginConfig{Plugins: pluginList(mainPlugin)},
+	})
 	if err != nil {
-		_ = store.Close()
-		_ = mcpManager.Close()
-		return nil, fmt.Errorf("create runner: %w", err)
+		return fail(fmt.Errorf("create runner: %w", err))
 	}
-	return &Runtime{
-		cfg:       cfg,
-		profile:   profileName,
-		modelName: profile.Model,
-		sessionID: sessionID,
-		userID:    "local",
-		appName:   config.AppName,
-		runner:    r,
-		store:     store,
-		mcp:       mcpManager,
-		plan:      board,
-		skillList: skillList,
-		toolDeps:  toolDeps,
-		log:       logger,
-	}, nil
+	rt.runner = r
+	return rt, nil
+}
+
+func logWarnings(logger *slog.Logger, kind string, warnings []string) {
+	for _, warning := range warnings {
+		logger.Warn(kind+" warning", "detail", warning)
+	}
+}
+
+func pluginList(p *plugin.Plugin) []*plugin.Plugin {
+	if p == nil {
+		return nil
+	}
+	return []*plugin.Plugin{p}
 }
 
 func buildCompaction(c config.CompactionConfig) (*compaction.Config, error) {
@@ -256,9 +345,9 @@ func (r *Runtime) MCPTools() []string {
 	if r.mcp == nil {
 		return nil
 	}
-	tools := r.mcp.Tools()
-	out := make([]string, 0, len(tools))
-	for _, t := range tools {
+	list := r.mcp.Tools()
+	out := make([]string, 0, len(list))
+	for _, t := range list {
 		out = append(out, t.Name())
 	}
 	return out
@@ -267,6 +356,20 @@ func (r *Runtime) MCPTools() []string {
 func (r *Runtime) Skills() []skills.Skill {
 	out := make([]skills.Skill, len(r.skillList))
 	copy(out, r.skillList)
+	return out
+}
+
+// Subagents returns the discovered subagent definitions.
+func (r *Runtime) Subagents() []subagents.Definition {
+	out := make([]subagents.Definition, len(r.subagentList))
+	copy(out, r.subagentList)
+	return out
+}
+
+// Commands returns the discovered custom slash commands.
+func (r *Runtime) Commands() []commands.Command {
+	out := make([]commands.Command, len(r.commandList))
+	copy(out, r.commandList)
 	return out
 }
 
@@ -305,13 +408,21 @@ func (r *Runtime) Run(ctx context.Context, prompt string, emit Emitter) error {
 	if emit == nil {
 		emit = func(Event) {}
 	}
+	r.runMu.Lock()
+	defer r.runMu.Unlock()
+	if r.runner == nil {
+		return fmt.Errorf("runtime is not ready")
+	}
+	r.hub.SetSink(emit)
+	defer r.hub.SetSink(nil)
+
 	sessionID := r.SessionID()
 	maxCalls := r.cfg.Agent.MaxLLMCalls
 	if maxCalls == 0 {
 		maxCalls = 50
 	}
 	r.plan.SetEmitter(func(steps []plan.Step) {
-		emit(Event{Type: EventPlan, Plan: append([]plan.Step(nil), steps...)})
+		r.hub.Emit(Event{Type: EventPlan, Plan: append([]plan.Step(nil), steps...)})
 	})
 	defer r.plan.SetEmitter(nil)
 
@@ -323,18 +434,18 @@ func (r *Runtime) Run(ctx context.Context, prompt string, emit Emitter) error {
 	}) {
 		if err != nil {
 			if ctx.Err() != nil {
-				emit(Event{Type: EventDone})
+				r.hub.Emit(Event{Type: EventDone})
 				return ctx.Err()
 			}
-			emit(Event{Type: EventError, Err: err})
-			emit(Event{Type: EventDone})
+			r.hub.Emit(Event{Type: EventError, Err: err})
+			r.hub.Emit(Event{Type: EventDone})
 			return err
 		}
 		for _, e := range mapper.Map(ev) {
-			emit(e)
+			r.hub.Emit(e)
 		}
 	}
-	emit(Event{Type: EventDone})
+	r.hub.Emit(Event{Type: EventDone})
 	return nil
 }
 
@@ -356,18 +467,92 @@ func (r *Runtime) HistoryFor(ctx context.Context, sessionID string) ([]Event, er
 }
 
 // RunShell executes a user-initiated shell escape through the normal approval
-// policy.
+// policy. It does not run hooks; use RunShellWithHooks for the TUI.
 func (r *Runtime) RunShell(ctx context.Context, command string) (tools.ShellResult, error) {
 	return tools.RunShell(ctx, r.toolDeps, tools.ShellRequest{Command: command})
 }
 
+// RunShellWithHooks runs a shell escape and fires PreToolUse/PostToolUse hooks
+// exactly once around the command.
+func (r *Runtime) RunShellWithHooks(ctx context.Context, command string) (tools.ShellResult, error) {
+	r.runMu.Lock()
+	defer r.runMu.Unlock()
+	var notices []string
+	addNotices := func(res hooks.Result) {
+		notices = append(notices, res.SystemMessages...)
+		notices = append(notices, res.Warnings...)
+	}
+	if r.hookRunner != nil {
+		res := r.hookRunner.Run(ctx, config.HookPreToolUse, hooks.Input{
+			ToolName:  "run_command",
+			ToolInput: map[string]any{"command": command},
+			ToolUseID: "shell-escape",
+		})
+		addNotices(res)
+		if res.Blocked {
+			return tools.ShellResult{
+				Command: command, Stdout: strings.Join(notices, "\n"),
+				ExitCode: -1, Status: tools.JobKilled,
+			}, fmt.Errorf("blocked by PreToolUse hook: %s", res.Reason)
+		}
+	}
+	result, err := tools.RunShell(ctx, r.toolDeps, tools.ShellRequest{Command: command})
+	if r.hookRunner != nil && result.Command != "" {
+		toolErr := ""
+		if err != nil {
+			toolErr = err.Error()
+		}
+		res := r.hookRunner.Run(ctx, config.HookPostToolUse, hooks.Input{
+			ToolName:  "run_command",
+			ToolInput: map[string]any{"command": command},
+			ToolUseID: "shell-escape",
+			ToolResponse: map[string]any{
+				"exit_code": result.ExitCode,
+				"output":    result.Stdout,
+			},
+			ToolError: toolErr,
+		})
+		addNotices(res)
+		if res.Blocked {
+			notices = append(notices, "PostToolUse hook: "+res.Reason)
+		}
+	}
+	if len(notices) > 0 {
+		if result.Stdout != "" && !strings.HasSuffix(result.Stdout, "\n") {
+			result.Stdout += "\n"
+		}
+		result.Stdout += "[hook] " + strings.Join(notices, "\n[hook] ")
+	}
+	return result, err
+}
+
 func (r *Runtime) Close() error {
-	var errs []error
-	if r.mcp != nil {
-		errs = append(errs, r.mcp.Close())
+	if r == nil {
+		return nil
 	}
-	if r.store != nil {
-		errs = append(errs, r.store.Close())
-	}
-	return errors.Join(errs...)
+	r.closeOnce.Do(func() {
+		if r.hookRunner != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			res := r.hookRunner.Run(ctx, config.HookSessionEnd, hooks.Input{})
+			cancel()
+			for _, msg := range res.SystemMessages {
+				r.log.Info("hook", "detail", msg)
+			}
+			for _, msg := range res.Warnings {
+				r.log.Warn("hook warning", "detail", msg)
+			}
+		}
+		var errs []error
+		if r.jobs != nil {
+			errs = append(errs, r.jobs.Close())
+		}
+		if r.mcp != nil {
+			errs = append(errs, r.mcp.Close())
+		}
+		if r.store != nil {
+			errs = append(errs, r.store.Close())
+		}
+		r.closeErr = errors.Join(errs...)
+	})
+	return r.closeErr
 }

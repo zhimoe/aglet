@@ -13,6 +13,7 @@ import (
 	"charm.land/glamour/v2"
 
 	"github.com/zhimoe/aglet/internal/agent"
+	"github.com/zhimoe/aglet/internal/commands"
 	"github.com/zhimoe/aglet/internal/config"
 	"github.com/zhimoe/aglet/internal/permissions"
 	"github.com/zhimoe/aglet/internal/plan"
@@ -375,8 +376,9 @@ func (m *Model) handleSlash(text string) (tea.Model, tea.Cmd) {
 	case "/help":
 		m.items = append(m.items, &item{kind: itemInfo, text: `/help  /clear  /quit
 /sessions  /resume <id>  /new
-/skills  /status  /permissions  /mode <name>
+/skills  /agents  /commands  /status  /permissions  /mode <name>
 /plan [task]  /mcp  /diff  /review  /model
+/name args runs a custom command from .aglet/commands.
 !command runs a shell command; Enter sends; Ctrl+J newline; Esc cancels.`})
 		m.refresh()
 		return m, nil
@@ -416,6 +418,43 @@ func (m *Model) handleSlash(text string) (tea.Model, tea.Cmd) {
 			b.WriteString("Skills:\n")
 			for _, s := range list {
 				fmt.Fprintf(&b, "  %s — %s\n", s.Name, s.Description)
+			}
+			m.items = append(m.items, &item{kind: itemInfo, text: strings.TrimRight(b.String(), "\n")})
+		}
+		m.refresh()
+		return m, nil
+	case "/agents":
+		list := m.cfg.Runtime.Subagents()
+		if len(list) == 0 {
+			m.items = append(m.items, &item{kind: itemInfo, text: "no subagents"})
+		} else {
+			var b strings.Builder
+			b.WriteString("Subagents:\n")
+			for _, def := range list {
+				tools := "all tools"
+				if len(def.Tools) > 0 {
+					tools = strings.Join(def.Tools, ", ")
+				}
+				fmt.Fprintf(&b, "  %s — %s (tools: %s)\n", def.Name, def.Description, tools)
+			}
+			b.WriteString("The model invokes these through the task tool.")
+			m.items = append(m.items, &item{kind: itemInfo, text: b.String()})
+		}
+		m.refresh()
+		return m, nil
+	case "/commands":
+		list := m.cfg.Runtime.Commands()
+		if len(list) == 0 {
+			m.items = append(m.items, &item{kind: itemInfo, text: "no custom commands (add .aglet/commands/*.md)"})
+		} else {
+			var b strings.Builder
+			b.WriteString("Commands:\n")
+			for _, cmd := range list {
+				hint := ""
+				if cmd.ArgumentHint != "" {
+					hint = " " + cmd.ArgumentHint
+				}
+				fmt.Fprintf(&b, "  /%s%s — %s\n", cmd.Name, hint, cmd.Description)
 			}
 			m.items = append(m.items, &item{kind: itemInfo, text: strings.TrimRight(b.String(), "\n")})
 		}
@@ -502,6 +541,19 @@ func (m *Model) handleSlash(text string) (tea.Model, tea.Cmd) {
 		m.refresh()
 		return m, nil
 	default:
+		if cmd, ok := commands.Find(m.cfg.Runtime.Commands(), strings.TrimPrefix(command, "/")); ok {
+			if m.busy {
+				m.items = append(m.items, &item{kind: itemInfo, text: "cancel the current run before running a command"})
+				m.refresh()
+				return m, nil
+			}
+			expanded := commands.Expand(cmd, args)
+			m.items = append(m.items, &item{kind: itemUser, text: text})
+			m.busy = true
+			m.markNotStreaming()
+			m.refresh()
+			return m, m.startRun(expanded)
+		}
 		m.items = append(m.items, &item{kind: itemInfo, text: "unknown command: " + text})
 		m.refresh()
 		return m, nil
@@ -652,6 +704,11 @@ func (m *Model) applyEvent(ev agent.Event) {
 		m.planSteps = append([]plan.Step(nil), ev.Plan...)
 		m.updatePlanItem()
 		m.markNotStreaming()
+	case agent.EventNotice:
+		if strings.TrimSpace(ev.Text) != "" {
+			m.markNotStreaming()
+			m.items = append(m.items, &item{kind: itemInfo, text: ev.Text})
+		}
 	}
 }
 

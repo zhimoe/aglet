@@ -4,13 +4,10 @@ package tools
 
 import (
 	"os/exec"
-	"syscall"
+
+	"github.com/zhimoe/aglet/internal/proc"
 )
 
-func setProcessGroup(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-}
+func setProcessGroup(cmd *exec.Cmd) { proc.Configure(cmd) }
 
-func killProcessGroup(pid int) {
-	_ = syscall.Kill(-pid, syscall.SIGKILL)
-}
+func killProcessGroup(pid int) { proc.KillGroup(pid) }

@@ -157,12 +157,12 @@ func discoverTools(ctx context.Context, serverName string, s config.MCPServerCon
 			summary := fmt.Sprintf("%s/%s", server, mcpName)
 			if policy != nil {
 				if err := policy.Authorize(ctx, permissions.ApprovalRequest{
-					ToolName: name, Server: server, Summary: summary, Args: args,
+					ToolName: name, Server: server, Agent: ctx.AgentName(), Summary: summary, Args: args,
 				}, approver); err != nil {
 					return nil, err
 				}
 			} else if needsConfirm {
-				if err := authorizeMCP(ctx, name, server, summary, args, approver); err != nil {
+				if err := authorizeMCP(ctx, name, server, ctx.AgentName(), summary, args, approver); err != nil {
 					return nil, err
 				}
 			}
@@ -191,12 +191,12 @@ func discoverTools(ctx context.Context, serverName string, s config.MCPServerCon
 	return out, nil
 }
 
-func authorizeMCP(ctx context.Context, name, server, summary string, args map[string]any, approver permissions.Approver) error {
+func authorizeMCP(ctx context.Context, name, server, agent, summary string, args map[string]any, approver permissions.Approver) error {
 	if approver == nil {
 		return fmt.Errorf("tool %q requires approval but no approver is configured", name)
 	}
 	d, err := approver.Approve(ctx, permissions.ApprovalRequest{
-		ToolName: name, Server: server, Summary: summary, Args: args,
+		ToolName: name, Server: server, Agent: agent, Summary: summary, Args: args,
 	})
 	if err != nil {
 		return err

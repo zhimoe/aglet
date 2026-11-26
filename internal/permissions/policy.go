@@ -23,6 +23,7 @@ const (
 type ApprovalRequest struct {
 	ToolName string
 	Server   string // MCP server name; empty for local tools
+	Agent    string // agent or subagent requesting the call; empty when unknown
 	Summary  string
 	Args     map[string]any
 	Diff     string
@@ -102,6 +103,11 @@ var readOnlyTools = map[string]bool{
 	"git_log":     true,
 	"load_skill":  true,
 	"update_plan": true,
+	"task":        true,
+	"web_fetch":   true,
+	"web_search":  true,
+	"bash_output": true,
+	"kill_shell":  true,
 }
 
 func (p *Policy) decide(req ApprovalRequest) class {

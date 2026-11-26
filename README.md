@@ -13,6 +13,11 @@ A small terminal coding agent built with **Google ADK for Go v2** and **Bubble T
 - **Diff-aware approvals**: writes and edits show a unified diff before you approve them.
 - **Project context**: discovers `AGLET.md`, `AGENTS.md`, `AGENTS.override.md`, and `CLAUDE.md` from the workspace and its ancestors.
 - **Skills**: `SKILL.md` files with YAML frontmatter, loaded on demand with `load_skill`.
+- **Subagents**: a `task` tool delegates self-contained work to built-in `general`/`explore` agents or `.aglet/agents/*.md` definitions, with isolated context and optional model overrides.
+- **Hooks**: Claude-compatible `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `SessionStart`, `SessionEnd`, and `Stop` shell hooks.
+- **Custom commands**: Markdown prompt templates in `.aglet/commands`, invoked as `/name args` with `$ARGUMENTS`/`$1..$9`.
+- **Web tools**: `web_fetch` with an SSRF guard and HTML-to-text conversion, plus `web_search` for Tavily, Brave, and SearXNG.
+- **Background jobs**: `run_command` with `run_in_background`, then poll with `bash_output` and stop with `kill_shell`.
 - **Plan / todo panel**: the model updates a checklist with `update_plan`; the TUI renders it and tracks progress.
 - **Git workflow**: `git_status`, `git_diff`, `git_log`, `git_commit`, plus `/diff`, `/review`, and `aglet review`.
 - **Persistent sessions**: SQLite-backed sessions, list/resume/continue, history replay in the TUI.
@@ -148,9 +153,11 @@ Slash commands:
 ```text
 /help  /clear  /quit
 /sessions  /resume <id>  /new
-/skills  /status  /permissions  /mode <name>
+/skills  /agents  /commands  /status  /permissions  /mode <name>
 /plan [task]  /mcp  /diff  /review  /model
 ```
+
+`/name args` runs a custom command from `.aglet/commands`.
 
 ## CLI
 
@@ -162,6 +169,8 @@ aglet sessions list              list stored sessions (no model key needed)
 aglet review [--base REF]        review a git diff with a read-only policy
 aglet config init [--path P]     write an example config
 aglet config show                print resolved config (secrets redacted)
+aglet commands list              list custom slash commands
+aglet agents list                list subagent definitions
 aglet mcp list                   connect MCP servers and list tools
 aglet version
 ```
@@ -239,15 +248,35 @@ A config with the Phase 2 fields:
   "context": {
     "instruction_files": ["AGLET.md", "AGENTS.md", "AGENTS.override.md", "CLAUDE.md"],
     "skills_dirs": [".agents/skills", ".aglet/skills", "~/.agents/skills", "~/.config/aglet/skills"],
+    "agents_dirs": [".aglet/agents", ".agents/agents", "~/.config/aglet/agents"],
+    "commands_dirs": [".aglet/commands", ".agents/commands", "~/.config/aglet/commands"],
     "skills_enabled": true,
     "max_instruction_bytes": 32768,
     "max_skill_bytes": 65536
   },
   "workspace": ".",
   "permissions": {
-    "auto_approve": ["read_file", "list_dir", "glob", "grep", "git_status", "git_diff", "git_log", "load_skill", "update_plan"],
+    "auto_approve": ["read_file", "list_dir", "glob", "grep", "git_status", "git_diff", "git_log", "load_skill", "update_plan", "task", "web_fetch", "web_search", "bash_output", "kill_shell"],
     "require_approval": ["write_file", "edit_file", "run_command", "git_commit", "mcp_*"],
     "deny": []
+  },
+  "hooks": {},
+  "web": {
+    "fetch": {
+      "enabled": true,
+      "max_bytes": 1048576,
+      "timeout_sec": 30,
+      "allow_private_networks": false,
+      "allowed_hosts": []
+    },
+    "search": {
+      "enabled": false,
+      "provider": "tavily",
+      "base_url": "",
+      "api_key_env": "TAVILY_API_KEY",
+      "max_results": 5,
+      "timeout_sec": 20
+    }
   },
   "session_db": "~/.local/share/aglet/sessions.db",
   "ui": {
@@ -259,6 +288,7 @@ A config with the Phase 2 fields:
 - API keys are read only from environment variables. The config stores the env var name, never the key.
 - `api` is `chat_completions` by default. DeepSeek and most third-party OpenAI-compatible services require this; `responses` is available for providers that support the OpenAI Responses API.
 - `workspace` confines all file tools. Paths are checked lexically and through symlinks.
+- `context.max_skill_bytes` caps the size of skills, custom commands, and subagent definition files.
 - `config show` prints the resolved config with MCP env/header values redacted.
 
 ### Approval modes
@@ -274,7 +304,9 @@ rules always win.
 | `full-auto` (alias `auto`, `yolo`) | Everything is auto-approved except explicit `deny` rules. |
 
 Read-only tools are `read_file`, `list_dir`, `glob`, `grep`, `git_status`,
-`git_diff`, `git_log`, `load_skill`, and `update_plan`.
+`git_diff`, `git_log`, `load_skill`, `update_plan`, `task`, `web_fetch`,
+`web_search`, `bash_output`, and `kill_shell`. Subagent tools still run through
+the same policy, so a write inside a subagent is denied or approved normally.
 
 Within `ask`/`auto-edit`, precedence is: explicit `deny` > mode restrictions >
 `permissions.require_approval` > `permissions.auto_approve` > default ask.
@@ -319,6 +351,151 @@ calls `load_skill` to read the full body when needed. Set
 `disable-model-invocation: true` to keep a skill out of the model's index.
 Duplicate names keep the first skill discovered; malformed skills produce
 warnings without blocking startup. Use `/skills` in the TUI to list them.
+
+### Subagents
+
+The model delegates through a single `task` tool with `subagent_type`,
+`description`, and a self-contained `prompt`. Two subagents are built in:
+
+- `general`: every local and MCP tool except `task` (no recursion).
+- `explore`: read-only file/search/git/skill tools plus `web_fetch` and
+  `web_search` when enabled.
+
+Custom definitions live in `.aglet/agents`, `.agents/agents`, or
+`~/.config/aglet/agents` (plus `context.agents_dirs`). Files are Markdown with
+YAML frontmatter:
+
+```markdown
+---
+name: reviewer
+description: Review a diff for correctness and risk
+tools: read_file, grep, git_diff
+model: deepseek
+---
+You are a strict code reviewer. Report findings with file paths.
+```
+
+`tools` accepts a YAML list or a comma-separated string and supports `mcp_*`
+globs; Claude Code names are normalized (`Read` → `read_file`, `Bash` →
+`run_command`, `TodoWrite` → `update_plan`). An empty `tools` means all local
+and MCP tools. `model` may be a profile name, another model ID on the current
+profile, or `inherit` (the default).
+Custom definitions override built-ins with the same name; `aglet agents list`
+shows the result.
+
+Each invocation gets a fresh in-memory session and a fresh private plan board,
+so subagent tool chatter and plans do not pollute the parent. Tools, approvals,
+hooks, web access, and background jobs are shared with the parent; approval
+prompts show the requesting agent. Each child run has its own
+`agent.max_llm_calls` budget, reported back as a usage event. Subagent sessions
+are ephemeral and cannot be resumed after the task returns.
+
+### Hooks
+
+Hooks are shell commands configured in `aglet.json`. Events use Claude Code
+names (case-insensitive):
+
+```json
+"hooks": {
+  "SessionStart": [
+    {"matcher": "^(startup|resume)$", "hooks": [
+      {"type": "command", "command": "bash ~/.aglet/hooks/session-state.sh", "timeout": 10}
+    ]}
+  ],
+  "PreToolUse": [
+    {"matcher": "run_command|write_file", "hooks": [
+      {"type": "command", "command": "~/.aglet/hooks/guard.sh", "timeout": 10}
+    ]}
+  ]
+}
+```
+
+Events: `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `SessionStart`,
+`SessionEnd`, `Stop`. Hooks receive a JSON object on stdin
+(`hook_event_name`, `session_id`, `cwd`, `permission_mode`, `tool_name`,
+`tool_input`, `tool_response`, `prompt`, `source`, ...) and `AGLET_*`
+environment variables. Exit code 2 blocks the action and uses stderr as the
+reason. Exit 0 may print JSON with `decision: "block"`, `continue: false`,
+`systemMessage`, or `hookSpecificOutput.additionalContext` /
+`permissionDecision: "deny"`. Other failures and timeouts are non-blocking
+notices.
+
+Semantics to keep in mind:
+
+- `permissionDecision: "allow"` does **not** bypass aglet's approval policy;
+  `deny` and `block` are enforced.
+- `PostToolUse` can add `hook_context`/`hook_feedback` to a successful result
+  but never rewrites an error result.
+- `Stop` hooks are observational in this version; a block becomes a notice and
+  cannot force another model turn.
+- `SessionStart`/`SessionEnd` fire on process start/exit, not on `/new` or
+  `/resume` session switches.
+- The TUI `!command` escape runs `PreToolUse`/`PostToolUse` exactly once;
+  `run_command` goes through the same hooks via the ADK plugin.
+- Hooks run with your user privileges. They are part of the trusted local
+  config, not a sandbox.
+
+Hook stdout/stderr are capped at 64 KiB, and the stdin payload is truncated for
+large tool arguments.
+
+### Custom commands
+
+Markdown files under `.aglet/commands`, `.agents/commands`, or
+`~/.config/aglet/commands` become slash commands. Subdirectories use `:`
+namespacing (`git/review.md` → `/git:review`):
+
+```markdown
+---
+description: Review a diff against a base revision
+argument-hint: "[base]"
+---
+Review the changes against $1. Focus on correctness and missing tests.
+Use $ARGUMENTS when you need the full argument string.
+```
+
+`$ARGUMENTS` expands to everything after the command name; `$1`..`$9` are
+positional arguments. If the body has no placeholder, arguments are appended.
+`\$` is a literal dollar sign. Built-in slash commands win over custom names.
+
+Run a command in the TUI with `/name args`, or headlessly with
+`aglet run "/name args"`. `/commands` and `aglet commands list` show what was
+discovered. The `allowed-tools` and `model` frontmatter fields are parsed but
+not enforced in this version. Claude-style `!` (bash expansion) and `@` (file
+reference) syntax is not executed; the body is sent as a prompt after argument
+substitution.
+
+### Web tools
+
+`web_fetch` retrieves HTTP(S) URLs, blocks loopback/private/link-local targets
+by default, honors an optional host allowlist, follows at most five redirects,
+and converts HTML to readable text. `web_search` supports Tavily, Brave, and
+self-hosted SearXNG:
+
+```json
+"web": {
+  "fetch": {"enabled": true, "max_bytes": 1048576, "timeout_sec": 30,
+            "allow_private_networks": false, "allowed_hosts": []},
+  "search": {"enabled": true, "provider": "tavily", "base_url": "",
+             "api_key_env": "TAVILY_API_KEY", "max_results": 5, "timeout_sec": 20}
+}
+```
+
+API keys are read from the named environment variable; the config never stores
+the key. Search requests use the configured base URL as trusted administrator
+configuration (so a local SearXNG works), while `web_fetch` applies the SSRF
+guard. Both tools are read-only and auto-approved in the default config; remove
+them from `permissions.auto_approve` if arbitrary network egress is not
+acceptable. Fetched content is untrusted and may contain prompt injection.
+
+### Background jobs
+
+Set `run_in_background: true` on `run_command` to start a long-running process.
+The tool returns a `job_id` immediately. Poll with
+`bash_output {job_id, wait_ms?}` (new output only, up to 64 KiB per call,
+cursor-based) and stop it with `kill_shell {job_id}`. Jobs survive across turns,
+are limited to 32, and are killed when aglet exits. Starting a job still needs
+`run_command` approval; reading/killing is read-only. Job output buffers hold
+1 MiB and drop the oldest bytes when full.
 
 ### Context compaction
 
@@ -430,7 +607,10 @@ read-only tools.
 - Approval modes can loosen or tighten this, but explicit `deny` rules always win.
 - In headless mode, non-TTY stdin denies sensitive tools unless `--yes` is passed. Use `--deny` to force rejection.
 - `run_command` has a default 120s timeout (max 600s), truncates output, and kills the process group on cancellation. On Windows it uses `cmd.exe /C` and `taskkill /T /F`.
-- Project instruction files and skills are untrusted context; the prompt tells the model not to follow instructions from them that conflict with the user or policy.
+- Project instruction files, skills, custom command bodies, and fetched web content are untrusted context; the prompt tells the model not to follow instructions from them that conflict with the user or policy.
+- Hooks execute arbitrary local shell commands configured by the user. They can observe tool arguments/results and block calls; they are not sandboxed. Review hook scripts before enabling them.
+- `web_fetch` blocks private/link-local addresses and validates redirects, but it is still network egress. `web_search` uses the configured provider base URL. Remove the web tools from `permissions.auto_approve` in sensitive environments.
+- Subagents inherit the approval policy and hooks. Writes, shell commands, and MCP calls inside a subagent still prompt (and show the requesting agent). Subagent sessions are ephemeral.
 - No OS-level sandbox is provided. Run `aglet` in a dedicated directory or container when working with untrusted code, and avoid `--yes` there.
 
 ## Architecture
@@ -438,17 +618,24 @@ read-only tools.
 ```
 cmd/aglet            CLI entrypoint
 internal/cli         run / tui / resume / sessions / review / config / mcp
-internal/agent       ADK runtime, event bridge, prompt, compaction
-internal/tools       local file, search, shell, git, skill, and plan tools
+internal/agent       ADK runtime, event bridge, prompt, compaction, hooks bridge,
+                     subagent executor, task tool, emitter hub
+internal/tools       local file, search, shell, git, skill, plan, web, and background tools
 internal/mcp         custom MCP manager -> ADK function tools
 internal/permissions approval modes, allow/ask/deny policy, session grants
 internal/instructions AGLET.md / AGENTS.md discovery and injection
 internal/skills      SKILL.md discovery, frontmatter, index rendering
+internal/subagents   subagent definition discovery and built-ins
+internal/commands    custom slash command discovery and expansion
+internal/hooks       hook execution, matching, and JSON protocol
+internal/web         SSRF-guarded fetch, HTML-to-text, search providers
 internal/plan        thread-safe plan board and status validation
 internal/diff        unified diffs for approvals
 internal/session     ADK database session service (SQLite), list/preview
 internal/headless    stream output, JSONL, stdin approvals
 internal/tui         Bubble Tea v2 model, Markdown rendering, plan panel
+internal/proc        platform shell/process-group helpers
+internal/frontmatter Markdown YAML frontmatter splitting
 internal/config      JSON config loading and validation
 ```
 
@@ -483,14 +670,21 @@ upstream files. Use `go fmt ./...`, which only formats this module.
 Tests cover event mapping, a fake-model runtime + tool loop, plan events and
 session switching, config validation/redaction/compaction, permission modes,
 diff and skill discovery, instructions, git helpers, file/search tools,
-headless approvals, and in-memory MCP discovery.
+headless approvals, in-memory MCP discovery, hooks (blocking, JSON output,
+matchers, payloads), subagent discovery and a fake-model `task` round trip,
+custom command discovery/expansion, SSRF-guarded web fetch/HTML/search, and
+background job lifecycle/cursors.
 
 ## Current limitations
 
 - TUI Markdown rendering applies to completed assistant messages; streaming text is plain.
-- No syntax highlighting, hooks, subagents, ACP server, or LSP integration yet.
-- No session tree/fork/clone, steering queue, prompt templates, or runtime `/model` switching.
+- No syntax highlighting, ACP server, or LSP integration yet.
+- No session tree/fork/clone, steering queue, or runtime `/model` switching.
 - MCP resources/prompts and runtime reload are not implemented; only tools are discovered.
+- Stop hooks are observational and cannot force another model turn; hook `allow`/`ask` decisions do not override aglet's policy.
+- Custom command `allowed-tools` and `model` frontmatter are parsed but not enforced.
+- Subagent/command/hook definitions are loaded at startup; restart aglet after editing them.
+- Subagent sessions are ephemeral (no resume), and background jobs live only for the process lifetime (not persisted across restarts).
 - No OS sandbox; approval and workspace checks are the current boundary.
 - The Windows target is cross-compiled and compile-checked here; it has not been run on a real Windows machine in this repo's test setup. Please run `go test ./...` and a quick `aglet run` on Windows before relying on it.
 

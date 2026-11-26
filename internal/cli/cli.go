@@ -19,11 +19,13 @@ import (
 	"golang.org/x/term"
 
 	"github.com/zhimoe/aglet/internal/agent"
+	"github.com/zhimoe/aglet/internal/commands"
 	"github.com/zhimoe/aglet/internal/config"
 	"github.com/zhimoe/aglet/internal/headless"
 	mcpmanager "github.com/zhimoe/aglet/internal/mcp"
 	"github.com/zhimoe/aglet/internal/permissions"
 	sessionstore "github.com/zhimoe/aglet/internal/session"
+	"github.com/zhimoe/aglet/internal/subagents"
 	"github.com/zhimoe/aglet/internal/tui"
 	"github.com/zhimoe/aglet/internal/version"
 )
@@ -46,6 +48,10 @@ func Run(args []string) int {
 		return reviewCmd(args[1:])
 	case "config":
 		return configCmd(args[1:])
+	case "commands":
+		return commandsCmd(args[1:])
+	case "agents":
+		return agentsCmd(args[1:])
 	case "mcp":
 		return mcpCmd(args[1:])
 	case "version", "--version", "-v":
@@ -72,6 +78,8 @@ Usage:
   aglet review [--base REF]        review a git diff
   aglet config init [--path P]     write an example config
   aglet config show                print resolved config (secrets redacted)
+  aglet commands list              list custom slash commands
+  aglet agents list                list subagent definitions
   aglet mcp list                   connect MCP servers and list tools
   aglet version
 
@@ -267,6 +275,11 @@ func runCmd(args []string) int {
 	}
 	defer rt.Close()
 
+	if name, args, ok := commands.ParseInvocation(prompt); ok {
+		if cmd, found := commands.Find(rt.Commands(), name); found {
+			prompt = commands.Expand(cmd, args)
+		}
+	}
 	if err := headless.Run(ctx, rt, prompt, opts); err != nil {
 		if ctx.Err() != nil {
 			return 130
@@ -596,6 +609,102 @@ func configCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: aglet config init|show")
 		return 2
 	}
+}
+
+func commandsCmd(args []string) int {
+	if len(args) == 0 || args[0] != "list" {
+		fmt.Fprintln(os.Stderr, "usage: aglet commands list")
+		return 2
+	}
+	fs := flag.NewFlagSet("commands list", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var cf commonFlags
+	cf.register(fs)
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	cfg, err := loadConfig(&cf)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "config: %v\n", err)
+		return 2
+	}
+	list, warnings, err := commands.Discover(workspacePath(cfg.Workspace), cfg.Context.CommandsDirs, cfg.Context.MaxSkillBytes)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "commands: %v\n", err)
+		return 1
+	}
+	for _, warning := range warnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", warning)
+	}
+	if len(list) == 0 {
+		fmt.Println("no custom commands")
+		return 0
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "COMMAND\tARGUMENTS\tDESCRIPTION\tPATH")
+	for _, cmd := range list {
+		fmt.Fprintf(tw, "/%s\t%s\t%s\t%s\n", cmd.Name, cmd.ArgumentHint, cmd.Description, cmd.Path)
+	}
+	_ = tw.Flush()
+	return 0
+}
+
+func agentsCmd(args []string) int {
+	if len(args) == 0 || args[0] != "list" {
+		fmt.Fprintln(os.Stderr, "usage: aglet agents list")
+		return 2
+	}
+	fs := flag.NewFlagSet("agents list", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var cf commonFlags
+	cf.register(fs)
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	cfg, err := loadConfig(&cf)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "config: %v\n", err)
+		return 2
+	}
+	list, warnings, err := subagents.Discover(workspacePath(cfg.Workspace), cfg.Context.AgentsDirs, cfg.Context.MaxSkillBytes)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agents: %v\n", err)
+		return 1
+	}
+	for _, warning := range warnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", warning)
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tKIND\tTOOLS\tDESCRIPTION\tPATH")
+	for _, def := range list {
+		kind := "custom"
+		path := def.Path
+		if def.BuiltIn {
+			kind = "builtin"
+			path = "-"
+		}
+		tools := strings.Join(def.Tools, ",")
+		if tools == "" {
+			tools = "all"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", def.Name, kind, tools, def.Description, path)
+	}
+	_ = tw.Flush()
+	return 0
+}
+
+func workspacePath(p string) string {
+	p = config.ExpandPath(p)
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
 }
 
 func mcpCmd(args []string) int {

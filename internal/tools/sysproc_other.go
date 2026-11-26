@@ -2,8 +2,12 @@
 
 package tools
 
-import "os/exec"
+import (
+	"os/exec"
 
-func setProcessGroup(cmd *exec.Cmd) {}
+	"github.com/zhimoe/aglet/internal/proc"
+)
 
-func killProcessGroup(pid int) {}
+func setProcessGroup(cmd *exec.Cmd) { proc.Configure(cmd) }
+
+func killProcessGroup(pid int) { proc.KillGroup(pid) }

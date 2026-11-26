@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -24,6 +26,8 @@ type Config struct {
 	SessionDB      string                     `json:"session_db"`
 	UI             UIConfig                   `json:"ui"`
 	StrictMCP      bool                       `json:"strict_mcp"`
+	Hooks          HooksConfig                `json:"hooks"`
+	Web            WebConfig                  `json:"web"`
 }
 
 type Profile struct {
@@ -51,6 +55,8 @@ type CompactionConfig struct {
 type ContextConfig struct {
 	InstructionFiles    []string `json:"instruction_files"`
 	SkillsDirs          []string `json:"skills_dirs"`
+	AgentsDirs          []string `json:"agents_dirs"`
+	CommandsDirs        []string `json:"commands_dirs"`
 	SkillsEnabled       *bool    `json:"skills_enabled"`
 	MaxInstructionBytes int      `json:"max_instruction_bytes"`
 	MaxSkillBytes       int      `json:"max_skill_bytes"`
@@ -58,6 +64,93 @@ type ContextConfig struct {
 
 func (c ContextConfig) SkillsEnabledValue() bool {
 	return c.SkillsEnabled == nil || *c.SkillsEnabled
+}
+
+// Hook event names. The JSON keys are accepted case-insensitively and with
+// optional underscores or dashes.
+const (
+	HookUserPromptSubmit = "UserPromptSubmit"
+	HookPreToolUse       = "PreToolUse"
+	HookPostToolUse      = "PostToolUse"
+	HookSessionStart     = "SessionStart"
+	HookSessionEnd       = "SessionEnd"
+	HookStop             = "Stop"
+)
+
+// HooksConfig maps an event name to its matcher groups.
+type HooksConfig map[string][]HookMatcherConfig
+
+type HookMatcherConfig struct {
+	Matcher string              `json:"matcher"`
+	Hooks   []HookCommandConfig `json:"hooks"`
+}
+
+type HookCommandConfig struct {
+	Type    string `json:"type"`
+	Command string `json:"command"`
+	Timeout int    `json:"timeout"`
+}
+
+// CanonicalHookEvent returns the canonical event name for a user-provided key.
+func CanonicalHookEvent(name string) (string, bool) {
+	key := strings.ToLower(strings.TrimSpace(name))
+	key = strings.NewReplacer("_", "", "-", "", " ", "").Replace(key)
+	switch key {
+	case "userpromptsubmit":
+		return HookUserPromptSubmit, true
+	case "pretooluse":
+		return HookPreToolUse, true
+	case "posttooluse":
+		return HookPostToolUse, true
+	case "sessionstart":
+		return HookSessionStart, true
+	case "sessionend":
+		return HookSessionEnd, true
+	case "stop":
+		return HookStop, true
+	default:
+		return "", false
+	}
+}
+
+// HookMatcherAllowed reports whether an event may carry a non-empty matcher.
+func HookMatcherAllowed(event string) bool {
+	switch event {
+	case HookPreToolUse, HookPostToolUse, HookSessionStart:
+		return true
+	default:
+		return false
+	}
+}
+
+type WebConfig struct {
+	Fetch  WebFetchConfig  `json:"fetch"`
+	Search WebSearchConfig `json:"search"`
+}
+
+type WebFetchConfig struct {
+	Enabled              *bool    `json:"enabled"`
+	MaxBytes             int      `json:"max_bytes"`
+	TimeoutSec           int      `json:"timeout_sec"`
+	AllowPrivateNetworks bool     `json:"allow_private_networks"`
+	AllowedHosts         []string `json:"allowed_hosts"`
+}
+
+type WebSearchConfig struct {
+	Enabled    *bool  `json:"enabled"`
+	Provider   string `json:"provider"`
+	BaseURL    string `json:"base_url"`
+	APIKeyEnv  string `json:"api_key_env"`
+	MaxResults int    `json:"max_results"`
+	TimeoutSec int    `json:"timeout_sec"`
+}
+
+func (w WebConfig) FetchEnabledValue() bool {
+	return w.Fetch.Enabled == nil || *w.Fetch.Enabled
+}
+
+func (w WebConfig) SearchEnabledValue() bool {
+	return w.Search.Enabled != nil && *w.Search.Enabled
 }
 
 // ApprovalMode constants and aliases.
@@ -122,6 +215,8 @@ func (u UIConfig) ShowThoughtsEnabled() bool {
 // filling fields missing from a user config.
 func Defaults() *Config {
 	showThoughts := true
+	fetchEnabled := true
+	searchEnabled := false
 	return &Config{
 		DefaultProfile: "deepseek",
 		Profiles: map[string]Profile{
@@ -146,17 +241,38 @@ func Defaults() *Config {
 		Context: ContextConfig{
 			InstructionFiles:    []string{"AGLET.md", "AGENTS.md", "AGENTS.override.md", "CLAUDE.md"},
 			SkillsDirs:          []string{".agents/skills", ".aglet/skills", "~/.agents/skills", "~/.config/aglet/skills"},
+			AgentsDirs:          []string{".aglet/agents", ".agents/agents", "~/.config/aglet/agents"},
+			CommandsDirs:        []string{".aglet/commands", ".agents/commands", "~/.config/aglet/commands"},
 			MaxInstructionBytes: 32 * 1024,
 			MaxSkillBytes:       64 * 1024,
 		},
 		Workspace: ".",
 		Permissions: PermissionsConfig{
-			AutoApprove:     []string{"read_file", "list_dir", "glob", "grep", "git_status", "git_diff", "git_log", "load_skill", "update_plan"},
+			AutoApprove: []string{
+				"read_file", "list_dir", "glob", "grep", "git_status", "git_diff", "git_log",
+				"load_skill", "update_plan", "task", "web_fetch", "web_search",
+				"bash_output", "kill_shell",
+			},
 			RequireApproval: []string{"write_file", "edit_file", "run_command", "git_commit", "mcp_*"},
 		},
 		SessionDB:  "~/.local/share/aglet/sessions.db",
 		UI:         UIConfig{ShowThoughts: &showThoughts},
 		MCPServers: map[string]MCPServerConfig{},
+		Hooks:      HooksConfig{},
+		Web: WebConfig{
+			Fetch: WebFetchConfig{
+				Enabled:    &fetchEnabled,
+				MaxBytes:   1024 * 1024,
+				TimeoutSec: 30,
+			},
+			Search: WebSearchConfig{
+				Enabled:    &searchEnabled,
+				Provider:   "tavily",
+				APIKeyEnv:  "TAVILY_API_KEY",
+				MaxResults: 5,
+				TimeoutSec: 20,
+			},
+		},
 	}
 }
 
@@ -215,6 +331,12 @@ func ApplyDefaults(cfg *Config) {
 	if cfg.Context.SkillsDirs == nil {
 		cfg.Context.SkillsDirs = d.Context.SkillsDirs
 	}
+	if cfg.Context.AgentsDirs == nil {
+		cfg.Context.AgentsDirs = d.Context.AgentsDirs
+	}
+	if cfg.Context.CommandsDirs == nil {
+		cfg.Context.CommandsDirs = d.Context.CommandsDirs
+	}
 	if cfg.Context.SkillsEnabled == nil {
 		enabled := true
 		cfg.Context.SkillsEnabled = &enabled
@@ -266,11 +388,77 @@ func ApplyDefaults(cfg *Config) {
 		}
 		cfg.MCPServers[name] = s
 	}
+	cfg.Hooks = normalizeHooks(cfg.Hooks)
+	applyWebDefaults(&cfg.Web, d.Web)
 	if cfg.SessionDB == "" {
 		cfg.SessionDB = d.SessionDB
 	}
 	if cfg.UI.ShowThoughts == nil {
 		cfg.UI.ShowThoughts = d.UI.ShowThoughts
+	}
+}
+
+func normalizeHooks(in HooksConfig) HooksConfig {
+	if len(in) == 0 {
+		return HooksConfig{}
+	}
+	out := make(HooksConfig, len(in))
+	for name, matchers := range in {
+		event, ok := CanonicalHookEvent(name)
+		if !ok {
+			event = name
+		}
+		for i := range matchers {
+			matchers[i].Matcher = strings.TrimSpace(matchers[i].Matcher)
+			for j := range matchers[i].Hooks {
+				hook := &matchers[i].Hooks[j]
+				hook.Type = strings.ToLower(strings.TrimSpace(hook.Type))
+				if hook.Type == "" {
+					hook.Type = "command"
+				}
+				hook.Command = strings.TrimSpace(hook.Command)
+				if hook.Timeout == 0 {
+					hook.Timeout = 30
+				}
+			}
+		}
+		out[event] = append(out[event], matchers...)
+	}
+	return out
+}
+
+func applyWebDefaults(w *WebConfig, d WebConfig) {
+	if w.Fetch.Enabled == nil {
+		w.Fetch.Enabled = d.Fetch.Enabled
+	}
+	if w.Fetch.MaxBytes <= 0 {
+		w.Fetch.MaxBytes = d.Fetch.MaxBytes
+	}
+	if w.Fetch.TimeoutSec <= 0 {
+		w.Fetch.TimeoutSec = d.Fetch.TimeoutSec
+	}
+	if w.Search.Enabled == nil {
+		w.Search.Enabled = d.Search.Enabled
+	}
+	w.Search.Provider = strings.ToLower(strings.TrimSpace(w.Search.Provider))
+	if w.Search.Provider == "" {
+		w.Search.Provider = d.Search.Provider
+	}
+	w.Search.BaseURL = strings.TrimSpace(w.Search.BaseURL)
+	w.Search.APIKeyEnv = strings.TrimSpace(w.Search.APIKeyEnv)
+	if w.Search.APIKeyEnv == "" {
+		switch w.Search.Provider {
+		case "tavily":
+			w.Search.APIKeyEnv = "TAVILY_API_KEY"
+		case "brave":
+			w.Search.APIKeyEnv = "BRAVE_API_KEY"
+		}
+	}
+	if w.Search.MaxResults <= 0 {
+		w.Search.MaxResults = d.Search.MaxResults
+	}
+	if w.Search.TimeoutSec <= 0 {
+		w.Search.TimeoutSec = d.Search.TimeoutSec
 	}
 }
 
@@ -337,6 +525,93 @@ func (c *Config) Validate() error {
 			}
 		default:
 			return fmt.Errorf("config: mcp_servers.%s.transport %q is invalid (want stdio, sse, http)", name, s.Transport)
+		}
+	}
+	if err := validateHooks(c.Hooks); err != nil {
+		return err
+	}
+	if err := validateWeb(c.Web); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateHooks(hooks HooksConfig) error {
+	for name, matchers := range hooks {
+		event, ok := CanonicalHookEvent(name)
+		if !ok {
+			return fmt.Errorf("config: hooks has unknown event %q (want UserPromptSubmit, PreToolUse, PostToolUse, SessionStart, SessionEnd or Stop)", name)
+		}
+		for i, matcher := range matchers {
+			if matcher.Matcher != "" {
+				if !HookMatcherAllowed(event) {
+					return fmt.Errorf("config: hooks.%s[%d].matcher is not supported for %s", event, i, event)
+				}
+				if _, err := regexp.Compile("^(?:" + matcher.Matcher + ")$"); err != nil {
+					return fmt.Errorf("config: hooks.%s[%d].matcher: %w", event, i, err)
+				}
+			}
+			if len(matcher.Hooks) == 0 {
+				return fmt.Errorf("config: hooks.%s[%d] has no hooks", event, i)
+			}
+			for j, hook := range matcher.Hooks {
+				if hook.Type != "" && hook.Type != "command" {
+					return fmt.Errorf("config: hooks.%s[%d].hooks[%d].type %q is invalid (want command)", event, i, j, hook.Type)
+				}
+				if hook.Command == "" {
+					return fmt.Errorf("config: hooks.%s[%d].hooks[%d].command is required", event, i, j)
+				}
+				if hook.Timeout < 0 || hook.Timeout > 600 {
+					return fmt.Errorf("config: hooks.%s[%d].hooks[%d].timeout must be 0..600 seconds", event, i, j)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateWeb(web WebConfig) error {
+	if web.Fetch.MaxBytes < 0 || web.Fetch.MaxBytes > 5*1024*1024 {
+		return fmt.Errorf("config: web.fetch.max_bytes must be 0..%d", 5*1024*1024)
+	}
+	if web.Fetch.TimeoutSec < 0 || web.Fetch.TimeoutSec > 120 {
+		return fmt.Errorf("config: web.fetch.timeout_sec must be 0..120")
+	}
+	for _, host := range web.Fetch.AllowedHosts {
+		host = strings.TrimSpace(host)
+		if host == "" || strings.Contains(host, "://") || strings.Contains(host, "/") {
+			return fmt.Errorf("config: web.fetch.allowed_hosts entry %q must be a hostname (optionally *.example.com)", host)
+		}
+	}
+	provider := strings.ToLower(strings.TrimSpace(web.Search.Provider))
+	switch provider {
+	case "", "tavily", "brave", "searxng":
+	default:
+		return fmt.Errorf("config: web.search.provider %q is invalid (want tavily, brave or searxng)", web.Search.Provider)
+	}
+	if web.Search.MaxResults < 0 || web.Search.MaxResults > 20 {
+		return fmt.Errorf("config: web.search.max_results must be 0..20")
+	}
+	if web.Search.TimeoutSec < 0 || web.Search.TimeoutSec > 120 {
+		return fmt.Errorf("config: web.search.timeout_sec must be 0..120")
+	}
+	if !web.SearchEnabledValue() {
+		return nil
+	}
+	switch provider {
+	case "tavily", "brave":
+		if web.Search.APIKeyEnv == "" {
+			return fmt.Errorf("config: web.search.api_key_env is required for %s", provider)
+		}
+	case "searxng":
+		if web.Search.BaseURL == "" {
+			return fmt.Errorf("config: web.search.base_url is required for searxng")
+		}
+	}
+	if web.Search.BaseURL != "" {
+		u, err := url.Parse(web.Search.BaseURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("config: web.search.base_url must be an http(s) URL")
 		}
 	}
 	return nil
@@ -454,15 +729,35 @@ const ExampleJSON = `{
   "context": {
     "instruction_files": ["AGLET.md", "AGENTS.md", "AGENTS.override.md", "CLAUDE.md"],
     "skills_dirs": [".agents/skills", ".aglet/skills", "~/.agents/skills", "~/.config/aglet/skills"],
+    "agents_dirs": [".aglet/agents", ".agents/agents", "~/.config/aglet/agents"],
+    "commands_dirs": [".aglet/commands", ".agents/commands", "~/.config/aglet/commands"],
     "skills_enabled": true,
     "max_instruction_bytes": 32768,
     "max_skill_bytes": 65536
   },
   "workspace": ".",
   "permissions": {
-    "auto_approve": ["read_file", "list_dir", "glob", "grep", "git_status", "git_diff", "git_log", "load_skill", "update_plan"],
+    "auto_approve": ["read_file", "list_dir", "glob", "grep", "git_status", "git_diff", "git_log", "load_skill", "update_plan", "task", "web_fetch", "web_search", "bash_output", "kill_shell"],
     "require_approval": ["write_file", "edit_file", "run_command", "git_commit", "mcp_*"],
     "deny": []
+  },
+  "hooks": {},
+  "web": {
+    "fetch": {
+      "enabled": true,
+      "max_bytes": 1048576,
+      "timeout_sec": 30,
+      "allow_private_networks": false,
+      "allowed_hosts": []
+    },
+    "search": {
+      "enabled": false,
+      "provider": "tavily",
+      "base_url": "",
+      "api_key_env": "TAVILY_API_KEY",
+      "max_results": 5,
+      "timeout_sec": 20
+    }
   },
   "mcp_servers": {
     "everything": {

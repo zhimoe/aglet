@@ -1,8 +1,10 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -167,6 +169,120 @@ func TestCompactionValidation(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("sliding-window-only compaction should be valid: %v", err)
 	}
+}
+
+func TestPhase3Defaults(t *testing.T) {
+	cfg := Defaults()
+	if len(cfg.Context.AgentsDirs) == 0 || len(cfg.Context.CommandsDirs) == 0 {
+		t.Fatalf("context dirs = %#v", cfg.Context)
+	}
+	if !cfg.Web.FetchEnabledValue() || cfg.Web.SearchEnabledValue() {
+		t.Fatalf("web defaults = %#v", cfg.Web)
+	}
+	if cfg.Hooks == nil {
+		t.Fatal("hooks map should be initialized")
+	}
+	for _, tool := range []string{"task", "web_fetch", "web_search", "bash_output", "kill_shell"} {
+		if !slices.Contains(cfg.Permissions.AutoApprove, tool) {
+			t.Fatalf("auto_approve missing %s: %v", tool, cfg.Permissions.AutoApprove)
+		}
+	}
+	for _, needle := range []string{`"agents_dirs"`, `"commands_dirs"`, `"hooks"`, `"web"`} {
+		if !strings.Contains(ExampleJSON, needle) {
+			t.Fatalf("ExampleJSON missing %s", needle)
+		}
+	}
+}
+
+func TestHooksValidation(t *testing.T) {
+	valid := HookCommandConfig{Command: "hook.sh"}
+	cases := []struct {
+		name  string
+		hooks HooksConfig
+		ok    bool
+	}{
+		{"valid session matcher", HooksConfig{"SessionStart": {{Matcher: "startup", Hooks: []HookCommandConfig{valid}}}}, true},
+		{"unknown event", HooksConfig{"Unknown": {{Hooks: []HookCommandConfig{valid}}}}, false},
+		{"bad regex", HooksConfig{"PreToolUse": {{Matcher: "[", Hooks: []HookCommandConfig{valid}}}}, false},
+		{"matcher not allowed", HooksConfig{"UserPromptSubmit": {{Matcher: "x", Hooks: []HookCommandConfig{valid}}}}, false},
+		{"empty hooks", HooksConfig{"PreToolUse": {{}}}, false},
+		{"empty command", HooksConfig{"PreToolUse": {{Hooks: []HookCommandConfig{{}}}}}, false},
+		{"bad type", HooksConfig{"PreToolUse": {{Hooks: []HookCommandConfig{{Type: "http", Command: "x"}}}}}, false},
+		{"bad timeout", HooksConfig{"PreToolUse": {{Hooks: []HookCommandConfig{{Command: "x", Timeout: 1000}}}}}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.Hooks = tc.hooks
+			err := cfg.Validate()
+			if tc.ok && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
+func TestWebValidation(t *testing.T) {
+	enabled := true
+	disabled := false
+	base := Defaults()
+	base.Web.Search.Enabled = &enabled
+	base.Web.Search.Provider = "searxng"
+	base.Web.Search.BaseURL = ""
+	if err := base.Validate(); err == nil {
+		t.Fatal("expected searxng base_url error")
+	}
+	base.Web.Search.BaseURL = "http://localhost:8888"
+	if err := base.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	base.Web.Search.Provider = "unknown"
+	if err := base.Validate(); err == nil {
+		t.Fatal("expected provider error")
+	}
+	tavily := Defaults()
+	tavily.Web.Search.Enabled = &enabled
+	tavily.Web.Search.Provider = "tavily"
+	tavily.Web.Search.APIKeyEnv = ""
+	if err := tavily.Validate(); err == nil {
+		t.Fatal("expected api key env error")
+	}
+	size := Defaults()
+	size.Web.Fetch.MaxBytes = 10 * 1024 * 1024
+	if err := size.Validate(); err == nil {
+		t.Fatal("expected max_bytes error")
+	}
+	off := Defaults()
+	off.Web.Search.Enabled = &disabled
+	off.Web.Search.Provider = ""
+	if err := off.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExampleJSONParses(t *testing.T) {
+	check := func(name string, data []byte) {
+		t.Helper()
+		var cfg Config
+		dec := json.NewDecoder(strings.NewReader(string(data)))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&cfg); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		ApplyDefaults(&cfg)
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	check("ExampleJSON", []byte(ExampleJSON))
+	root, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	check("config.example.json", root)
 }
 
 func TestExpandPath(t *testing.T) {
